@@ -2,7 +2,7 @@
 name = "arthax-backend"
 version = "0.1.0"
 description = "arthaX Python backend (strict API -> DB)"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "fastapi>=0.116.1",
   "uvicorn[standard]>=0.35.0",
