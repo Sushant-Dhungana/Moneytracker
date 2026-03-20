@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -63,6 +63,27 @@ class Settings(BaseSettings):
     )
     embedding_model_id: str = Field(default="amazon.titan-embed-text-v2:0", alias="EMBEDDING_MODEL_ID")
     embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
+    receipt_aws_access_key_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RECEIPT_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+    )
+    receipt_aws_secret_access_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RECEIPT_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+    )
+    receipt_aws_session_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RECEIPT_AWS_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
+    )
+    receipt_aws_region: str = Field(
+        default="us-east-1",
+        validation_alias=AliasChoices("RECEIPT_AWS_REGION", "AWS_REGION"),
+    )
+    receipt_textract_endpoint: str | None = Field(
+        default=None,
+        alias="RECEIPT_TEXTRACT_ENDPOINT",
+    )
+    receipt_timeout_sec: int = Field(default=30, alias="RECEIPT_TIMEOUT_SEC")
 
     @property
     def supabase_issuer(self) -> str:

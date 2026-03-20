@@ -11,6 +11,7 @@ from app.api.v1.health import router as health_router
 from app.api.v1.ledger import router as ledger_router
 from app.api.v1.profile import router as profile_router
 from app.api.v1.profiles import router as profiles_router
+from app.api.v1.receipt import router as receipt_router
 from app.api.v1.summary import router as summary_router
 from app.api.v1.transactions import router as transactions_router
 
@@ -22,6 +23,7 @@ router.include_router(business_router)
 router.include_router(health_router)
 router.include_router(profile_router)
 router.include_router(profiles_router)
+router.include_router(receipt_router)
 router.include_router(summary_router)
 router.include_router(transactions_router)
 router.include_router(accounts_router)
