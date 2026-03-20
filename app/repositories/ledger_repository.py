@@ -110,6 +110,25 @@ def find_income_expense_entry_by_transaction_id(
         return cur.fetchone()
 
 
+def find_ledger_entry_by_transaction_id(
+    conn: Connection, *, user_id: str, txn_type: str, transaction_id: str
+) -> dict | None:
+    query = """
+    select
+      le.id::text as entry_id,
+      le.txn_type,
+      le.metadata
+    from public.ledger_entries le
+    where le.user_id = %s::uuid
+      and le.txn_type = %s
+      and coalesce(le.metadata->>'transaction_id', '') = %s
+    limit 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (user_id, txn_type, transaction_id))
+        return cur.fetchone()
+
+
 def update_income_expense_entry(
     conn: Connection,
     *,

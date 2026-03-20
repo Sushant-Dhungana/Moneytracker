@@ -205,7 +205,10 @@ STOCK_HINT_PATTERN = re.compile(
     r"\b(stock|inventory|qty|quantity|available|availability|stock ma)\b",
     re.IGNORECASE,
 )
-PRICE_HINT_PATTERN = re.compile(r"\b(price|rate|selling price|cost)\b", re.IGNORECASE)
+PRICE_HINT_PATTERN = re.compile(
+    r"\b(price|rate|selling price|cost|sp|sale price|sales price)\b",
+    re.IGNORECASE,
+)
 LOW_STOCK_HINT_PATTERN = re.compile(r"\b(low stock|low|minimum stock|kam stock)\b", re.IGNORECASE)
 STOCK_EXISTENCE_HINT_PATTERN = re.compile(
     r"\b(cha ki chaina|cha ki|stock ma cha|available|in stock|out of stock|cha|chaina)\b",
@@ -1259,9 +1262,14 @@ def _fetch_active_products(
     elif has_quantity_col:
         qty_expr = "coalesce(p.quantity, 0)"
 
-    selling_price_expr = (
-        "coalesce(p.selling_price, 0)" if has_selling_price_col else "null::numeric"
-    )
+    if has_selling_price_col and has_price_col:
+        selling_price_expr = "coalesce(p.selling_price, p.price, 0)"
+    elif has_selling_price_col:
+        selling_price_expr = "coalesce(p.selling_price, 0)"
+    elif has_price_col:
+        selling_price_expr = "coalesce(p.price, 0)"
+    else:
+        selling_price_expr = "null::numeric"
     base_price_expr = "coalesce(p.price, 0)" if has_price_col else "null::numeric"
     avg_cost_expr = "coalesce(pss.avg_unit_cost, 0)" if has_avg_unit_cost_col else "null::numeric"
 

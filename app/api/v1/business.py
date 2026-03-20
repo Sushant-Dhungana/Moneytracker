@@ -64,6 +64,12 @@ _BUSINESS_CATEGORY_DOMAINS = {"product", "customer", "supplier", "income", "expe
 _BUSINESS_CATEGORY_SEPARATOR_RE = re.compile(r"[_\-/.]+")
 _BUSINESS_CATEGORY_WHITESPACE_RE = re.compile(r"\s+")
 
+
+def _resolved_product_selling_price(row: dict) -> float:
+    if "selling_price" in row and row.get("selling_price") is not None:
+        return float(row.get("selling_price") or 0)
+    return float(row.get("price") or 0)
+
 _ALLOWED_RPC_NAMES = {
     "create_stock_in_entry",
     "create_stock_in_with_product_source",
@@ -522,6 +528,7 @@ def post_business_sale(
     conn: Connection = Depends(get_db_conn),
 ) -> BusinessSaleResponse:
     apply_db_auth_context(conn, auth.user_id)
+    endpoint_started_at = perf_counter()
 
     existing_receipt = _load_mutation_receipt(
         conn,
@@ -578,7 +585,13 @@ def post_business_sale(
             )
 
     normalized_entry_date = _parse_iso_date_or_raise(payload.date)
+    write_stage_ms = 0.0
+    entry_lookup_ms = 0.0
+    ai_refresh_ms = 0.0
+    receipt_ms = 0.0
+    used_direct_fallback = False
     with conn.transaction():
+        write_stage_started_at = perf_counter()
         try:
             result = _execute_named_rpc(
                 conn,
@@ -607,6 +620,7 @@ def post_business_sale(
         except ApiError as exc:
             if not _should_fallback_to_direct_sale(exc):
                 raise
+            used_direct_fallback = True
             try:
                 result = _create_sales_invoice_entry_direct(
                     conn,
@@ -624,14 +638,17 @@ def post_business_sale(
                 )
             except PsycopgError as db_exc:
                 raise _translate_rpc_db_error("create_sales_invoice_entry", db_exc) from db_exc
+        write_stage_ms = (perf_counter() - write_stage_started_at) * 1000
 
     invoice_id = str(result or "").strip()
+    entry_lookup_started_at = perf_counter()
     entry_id = _find_sale_entry_id_by_invoice(
         conn,
         user_id=auth.user_id,
         profile_id=payload.profile_id,
         invoice_id=invoice_id,
     )
+    entry_lookup_ms = (perf_counter() - entry_lookup_started_at) * 1000
     response = BusinessSaleResponse(
         invoice_id=invoice_id,
         entry_id=entry_id,
@@ -642,11 +659,14 @@ def post_business_sale(
         occurred_on=payload.date,
         account_delta=round(max(0.0, paid_amount), 2),
     )
+    ai_refresh_started_at = perf_counter()
     _enqueue_business_ai_refresh(
         conn,
         user_id=auth.user_id,
         profile_id=payload.profile_id,
     )
+    ai_refresh_ms = (perf_counter() - ai_refresh_started_at) * 1000
+    receipt_started_at = perf_counter()
     _store_mutation_receipt(
         conn,
         user_id=auth.user_id,
@@ -654,6 +674,18 @@ def post_business_sale(
         mutation_type="business.sale",
         idempotency_key=payload.idempotency_key,
         response_payload=response.model_dump(),
+    )
+    receipt_ms = (perf_counter() - receipt_started_at) * 1000
+    total_ms = (perf_counter() - endpoint_started_at) * 1000
+    print(
+        "[Perf] api POST /business/sales/post stages:"
+        f" total={total_ms:.1f}ms"
+        f" write={write_stage_ms:.1f}ms"
+        f" entry_lookup={entry_lookup_ms:.1f}ms"
+        f" ai_refresh={ai_refresh_ms:.1f}ms"
+        f" receipt={receipt_ms:.1f}ms"
+        f" direct_fallback={1 if used_direct_fallback else 0}"
+        f" items={len(payload.items)}"
     )
     return response
 
@@ -1664,7 +1696,13 @@ def _execute_stock_in_batch_item_rpc(
     item: BusinessStockInBatchItem,
     strategy: str | None = None,
 ) -> object:
+    normalized_payment_mode = str(payment_mode or "").strip().lower()
     chosen_strategy = strategy or _resolve_stock_in_batch_strategy(conn)
+    if normalized_payment_mode == "partial":
+        # Legacy stock-in RPCs in many deployed databases still only accept
+        # cash/bank/merchant/credit. Partial purchase support exists in the
+        # HTTP batch endpoint/direct path, so force the direct strategy here.
+        chosen_strategy = "direct"
     latest_params = {
         "p_user_id": user_id,
         "p_profile_id": profile_id,
@@ -1678,7 +1716,7 @@ def _execute_stock_in_batch_item_rpc(
         "p_qty": item.qty,
         "p_unit_cost": item.unit_cost,
         "p_selling_price": item.selling_price,
-        "p_payment_mode": payment_mode,
+        "p_payment_mode": normalized_payment_mode,
         "p_account_id": account_id,
         "p_paid_amount": item.paid_amount,
         "p_date": date_value,
@@ -1704,7 +1742,7 @@ def _execute_stock_in_batch_item_rpc(
         "p_qty": item.qty,
         "p_unit_cost": item.unit_cost,
         "p_selling_price": item.selling_price,
-        "p_payment_mode": payment_mode,
+        "p_payment_mode": normalized_payment_mode,
         "p_account_id": account_id,
         "p_date": date_value,
         "p_note": note,
@@ -1726,7 +1764,7 @@ def _execute_stock_in_batch_item_rpc(
         "p_product_id": item.product_id,
         "p_qty": item.qty,
         "p_unit_cost": item.unit_cost,
-        "p_payment_mode": payment_mode,
+        "p_payment_mode": normalized_payment_mode,
         "p_account_id": account_id,
         "p_date": date_value,
         "p_note": note,
@@ -1748,7 +1786,7 @@ def _execute_stock_in_batch_item_rpc(
         profile_id=profile_id,
         supplier_id=supplier_id,
         supplier_name=supplier_name,
-        payment_mode=payment_mode,
+        payment_mode=normalized_payment_mode,
         account_id=account_id,
         date_value=date_value,
         note=note,
@@ -1819,11 +1857,11 @@ def _create_stock_in_batch_item_direct(
     )
 
     normalized_mode = str(payment_mode or "cash").strip().lower()
-    if normalized_mode not in {"cash", "bank", "merchant", "credit"}:
+    if normalized_mode not in {"cash", "bank", "merchant", "credit", "partial"}:
         raise ApiError(
             status_code=400,
             code="invalid_payment_mode",
-            message="payment_mode must be one of: cash, bank, merchant, credit",
+            message="payment_mode must be one of: cash, bank, merchant, credit, partial",
         )
 
     qty = round(float(item.qty or 0), 3)
@@ -1844,6 +1882,21 @@ def _create_stock_in_batch_item_direct(
     if normalized_mode == "credit":
         account_applied = 0.0
         payable_amount = total_amount
+    elif normalized_mode == "partial":
+        account_applied = round(min(total_amount, paid_amount), 2)
+        payable_amount = round(max(0.0, total_amount - account_applied), 2)
+        if account_applied <= 0:
+            raise ApiError(
+                status_code=400,
+                code="invalid_partial_paid_amount",
+                message="Partial payment requires paid_amount greater than zero.",
+            )
+        if account_applied >= total_amount:
+            raise ApiError(
+                status_code=400,
+                code="invalid_partial_paid_amount",
+                message="Partial payment requires paid_amount less than total purchase amount.",
+            )
     else:
         account_applied = total_amount if requested_paid is None else min(total_amount, paid_amount)
         payable_amount = round(max(0.0, total_amount - account_applied), 2)
@@ -1915,15 +1968,20 @@ def _create_stock_in_batch_item_direct(
                 )
             resolved_supplier_name = candidate_supplier_name
 
-        if normalized_mode in {"cash", "bank", "merchant"}:
+        if normalized_mode in {"cash", "bank", "merchant", "partial"}:
             normalized_account_id = str(account_id or "").strip()
             if not normalized_account_id:
                 raise ApiError(
                     status_code=400,
                     code="missing_account",
-                    message="Account is required for cash/bank/merchant stock-in.",
+                    message="Account is required for cash/bank/merchant/partial stock-in.",
                 )
             if accounts_relation:
+                type_filter_sql = (
+                    "and type = %(account_type)s"
+                    if normalized_mode in {"cash", "bank", "merchant"}
+                    else "and type in ('cash', 'bank', 'merchant')"
+                )
                 cur.execute(
                     f"""
                     select 1
@@ -1932,14 +1990,16 @@ def _create_stock_in_batch_item_direct(
                       and user_id = %(user_id)s::uuid
                       and profile_id = %(profile_id)s::uuid
                       and is_active = true
-                      and type = %(account_type)s
+                      {type_filter_sql}
                     limit 1
                     """,
                     {
                         "account_id": normalized_account_id,
                         "user_id": user_id,
                         "profile_id": profile_id,
-                        "account_type": normalized_mode,
+                        "account_type": normalized_mode
+                        if normalized_mode in {"cash", "bank", "merchant"}
+                        else None,
                     },
                 )
                 if not cur.fetchone():
@@ -2777,6 +2837,38 @@ def _rpc_missing_message(rpc_name: str, exc: Exception) -> str:
     )
 
 
+def _translate_business_profile_assertion_error(exc: PsycopgError) -> ApiError:
+    message = str(exc).strip()
+    message_lower = message.lower()
+    if "business profile is not active" in message_lower:
+        return ApiError(
+            status_code=409,
+            code="business_profile_inactive",
+            message="The selected business profile is no longer active. Refresh the business profile and retry.",
+        )
+    return ApiError(
+        status_code=400,
+        code="business_profile_validation_failed",
+        message=message or "Failed to validate business profile.",
+    )
+
+
+def _assert_active_business_profile_or_raise(
+    conn: Connection,
+    *,
+    auth_user_id: str,
+    profile_id: str,
+) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
+                {"user_id": auth_user_id, "profile_id": profile_id},
+            )
+    except PsycopgError as exc:
+        raise _translate_business_profile_assertion_error(exc) from exc
+
+
 def _translate_rpc_db_error(rpc_name: str, exc: PsycopgError) -> ApiError:
     if isinstance(exc, UniqueViolation):
         constraint_name = ""
@@ -2814,6 +2906,9 @@ def _translate_rpc_db_error(rpc_name: str, exc: PsycopgError) -> ApiError:
             code="duplicate_record",
             message="A record with the same unique value already exists.",
         )
+
+    if "assert_active_business_profile" in str(exc) or "Business profile is not active" in str(exc):
+        return _translate_business_profile_assertion_error(exc)
 
     message = str(exc).strip() or f"Failed to execute RPC '{rpc_name}'."
     return ApiError(
@@ -2905,11 +3000,12 @@ def _list_business_units_direct(
     auth_user_id: str,
     profile_id: str,
 ) -> list[dict]:
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth_user_id,
+        profile_id=profile_id,
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-            {"user_id": auth_user_id, "profile_id": profile_id},
-        )
         cur.execute(
             """
             select
@@ -2937,11 +3033,12 @@ def _create_business_unit_direct(
     profile_id: str,
     name: str,
 ) -> dict:
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth_user_id,
+        profile_id=profile_id,
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-            {"user_id": auth_user_id, "profile_id": profile_id},
-        )
         cur.execute(
             """
             insert into business.units (user_id, profile_id, name)
@@ -3106,11 +3203,12 @@ def _list_business_products_direct(
     auth_user_id: str,
     profile_id: str,
 ) -> list[dict]:
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth_user_id,
+        profile_id=profile_id,
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-            {"user_id": auth_user_id, "profile_id": profile_id},
-        )
         cur.execute(
             """
             select *
@@ -4010,11 +4108,11 @@ def _list_business_suppliers_direct(
     profile_id: str,
     include_inactive: bool,
 ) -> list[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-            {"user_id": auth_user_id, "profile_id": profile_id},
-        )
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth_user_id,
+        profile_id=profile_id,
+    )
 
     relation = _business_suppliers_relation(conn)
     if not relation:
@@ -4552,6 +4650,12 @@ def post_business_rpc(
             account_id=account_id,
             amount=amount_value,
         )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("set local lock_timeout = '5000ms'")
+                cur.execute("set local statement_timeout = '20000ms'")
+        except Exception:
+            pass
 
     if payload.name == "collect_customer_receivable_entry":
         profile_id = str(params.get("p_profile_id") or "").strip()
@@ -4860,11 +4964,11 @@ def post_business_account_transfer(
 
     transfer_date = _parse_iso_date_or_raise(payload.date)
 
-    with conn.cursor() as cur:
-        cur.execute(
-            "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-            {"user_id": auth.user_id, "profile_id": profile_id},
-        )
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth.user_id,
+        profile_id=profile_id,
+    )
 
     current_balance_sql = _build_business_account_current_balance_sql(conn, active_only=True)
 
@@ -7051,12 +7155,13 @@ def _load_business_product_list_item(
     profile_id: str,
     product_id: str,
 ) -> dict | None:
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth_user_id,
+        profile_id=profile_id,
+    )
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-                {"user_id": auth_user_id, "profile_id": profile_id},
-            )
             cur.execute(
                 """
                 select
@@ -7763,7 +7868,7 @@ def create_business_product_endpoint(
             profile_id=str(product_row.get("profile_id") or ""),
             name=str(product_row.get("name") or ""),
             price=float(product_row.get("price") or 0),
-            selling_price=float(product_row.get("selling_price") or product_row.get("price") or 0),
+            selling_price=_resolved_product_selling_price(product_row),
             quantity=float(product_row.get("quantity") or 0),
             unit_id=str(product_row.get("unit_id") or ""),
             category_id=str(product_row.get("category_id") or "") or None,

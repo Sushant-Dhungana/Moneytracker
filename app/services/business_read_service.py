@@ -231,6 +231,62 @@ def _parse_number(value: object) -> float:
     return parsed if parsed == parsed else 0.0
 
 
+def _resolved_selling_price(row: dict) -> float:
+    if "selling_price" in row and row.get("selling_price") is not None:
+        return _parse_number(row.get("selling_price"))
+    return _parse_number(row.get("price"))
+
+
+def _fetch_business_product_selling_price_map(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+) -> dict[str, float]:
+    relation = _business_products_relation(conn)
+    if not relation:
+        return {}
+
+    has_profile_id = _relation_has_column(conn, relation, "profile_id")
+    has_price_col = _relation_has_column(conn, relation, "price")
+    has_selling_price_col = _relation_has_column(conn, relation, "selling_price")
+    has_is_active = _relation_has_column(conn, relation, "is_active")
+
+    if has_selling_price_col and has_price_col:
+        selling_price_sql = "coalesce(p.selling_price, p.price, 0)::double precision"
+    elif has_selling_price_col:
+        selling_price_sql = "coalesce(p.selling_price, 0)::double precision"
+    elif has_price_col:
+        selling_price_sql = "coalesce(p.price, 0)::double precision"
+    else:
+        selling_price_sql = "0::double precision"
+
+    where_clauses = ["p.user_id = %(user_id)s::uuid"]
+    if has_profile_id:
+        where_clauses.append("p.profile_id = %(profile_id)s::uuid")
+    if has_is_active:
+        where_clauses.append("p.is_active = true")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              p.id::text as id,
+              {selling_price_sql} as selling_price
+            from {relation} p
+            where {" and ".join(where_clauses)}
+            """,
+            {"user_id": user_id, "profile_id": profile_id},
+        )
+        rows = cur.fetchall() or []
+
+    return {
+        str(row.get("id") or "").strip(): _parse_number(row.get("selling_price"))
+        for row in rows
+        if str(row.get("id") or "").strip()
+    }
+
+
 def _normalize_string(value: object) -> str | None:
     normalized = str(value or "").strip()
     return normalized or None
@@ -875,6 +931,11 @@ def _fetch_business_product_categories(conn: Connection, *, user_id: str, profil
 def fetch_business_pos_bootstrap(conn: Connection, *, user_id: str, profile_id: str) -> dict:
     validate_business_profile_ownership(conn, user_id=user_id, profile_id=profile_id)
     accounts_relation = _business_accounts_relation(conn)
+    selling_price_by_id = _fetch_business_product_selling_price_map(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+    )
     with conn.cursor() as cur:
         cur.execute(
             "select * from public.list_business_products(%(profile_id)s::uuid)",
@@ -929,7 +990,10 @@ def fetch_business_pos_bootstrap(conn: Connection, *, user_id: str, profile_id: 
                 "profile_id": str(row.get("profile_id") or profile_id),
                 "name": str(row.get("name") or ""),
                 "price": _parse_number(row.get("price")),
-                "selling_price": _parse_number(row.get("selling_price") or row.get("price")),
+                "selling_price": selling_price_by_id.get(
+                    str(row.get("id") or "").strip(),
+                    _resolved_selling_price(row),
+                ),
                 "quantity": _parse_number(row.get("quantity")),
                 "unit_id": _normalize_string(row.get("unit_id")),
                 "category_id": _normalize_string(row.get("category_id")),

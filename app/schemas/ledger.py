@@ -50,6 +50,7 @@ class TransferCreateRequest(BaseModel):
     date: str
     description: str | None = None
     attachment_url: str | None = None
+    transaction_id: str | None = None
     metadata: dict | None = None
 
 
@@ -60,6 +61,7 @@ class LoanOutCreateRequest(BaseModel):
     date: str
     description: str | None = None
     attachment_url: str | None = None
+    transaction_id: str | None = None
     metadata: dict | None = None
 
 
@@ -70,6 +72,7 @@ class LoanInCreateRequest(BaseModel):
     date: str
     description: str | None = None
     attachment_url: str | None = None
+    transaction_id: str | None = None
     metadata: dict | None = None
 
 
@@ -80,6 +83,7 @@ class RepaymentInCreateRequest(BaseModel):
     date: str
     description: str | None = None
     attachment_url: str | None = None
+    transaction_id: str | None = None
     metadata: dict | None = None
 
 
@@ -90,4 +94,5 @@ class RepaymentOutCreateRequest(BaseModel):
     date: str
     description: str | None = None
     attachment_url: str | None = None
+    transaction_id: str | None = None
     metadata: dict | None = None

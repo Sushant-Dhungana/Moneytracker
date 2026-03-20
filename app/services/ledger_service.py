@@ -12,6 +12,7 @@ from app.repositories.ledger_repository import (
     create_repayment_in_entry,
     create_repayment_out_entry,
     create_transfer_entry,
+    find_ledger_entry_by_transaction_id,
     find_income_expense_entry_by_transaction_id,
     get_active_profile_id,
     get_entry_created_at,
@@ -240,6 +241,8 @@ def _create_ledger_entry_id_response(
     *,
     user_id: str,
     date_value: str,
+    txn_type: str,
+    transaction_id: str | None,
     create_fn,
 ) -> LedgerEntryIdResponse:
     _validate_not_future(date_value)
@@ -251,6 +254,16 @@ def _create_ledger_entry_id_response(
             code="missing_active_profile",
             message="No active profile found for this user.",
         )
+
+    resolved_transaction_id = transaction_id or str(uuid4())
+    existing = find_ledger_entry_by_transaction_id(
+        conn,
+        user_id=user_id,
+        txn_type=txn_type,
+        transaction_id=resolved_transaction_id,
+    )
+    if existing:
+        return LedgerEntryIdResponse(entry_id=str(existing["entry_id"]))
 
     try:
         entry_id = create_fn(profile_id)
@@ -273,10 +286,14 @@ def _create_ledger_entry_id_response(
 def create_transfer(
     conn: Connection, *, user_id: str, payload: TransferCreateRequest
 ) -> LedgerEntryIdResponse:
+    metadata = dict(payload.metadata or {})
+    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
+        txn_type="transfer",
+        transaction_id=metadata["transaction_id"],
         create_fn=lambda profile_id: create_transfer_entry(
             conn,
             user_id=user_id,
@@ -287,7 +304,7 @@ def create_transfer(
             date_value=payload.date,
             description=payload.description,
             attachment_url=payload.attachment_url,
-            metadata=payload.metadata,
+            metadata=metadata,
         ),
     )
 
@@ -295,10 +312,14 @@ def create_transfer(
 def create_loan_out(
     conn: Connection, *, user_id: str, payload: LoanOutCreateRequest
 ) -> LedgerEntryIdResponse:
+    metadata = dict(payload.metadata or {})
+    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
+        txn_type="loan_out",
+        transaction_id=metadata["transaction_id"],
         create_fn=lambda profile_id: create_loan_out_entry(
             conn,
             user_id=user_id,
@@ -309,7 +330,7 @@ def create_loan_out(
             date_value=payload.date,
             description=payload.description,
             attachment_url=payload.attachment_url,
-            metadata=payload.metadata,
+            metadata=metadata,
         ),
     )
 
@@ -317,10 +338,14 @@ def create_loan_out(
 def create_loan_in(
     conn: Connection, *, user_id: str, payload: LoanInCreateRequest
 ) -> LedgerEntryIdResponse:
+    metadata = dict(payload.metadata or {})
+    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
+        txn_type="loan_in",
+        transaction_id=metadata["transaction_id"],
         create_fn=lambda profile_id: create_loan_in_entry(
             conn,
             user_id=user_id,
@@ -331,7 +356,7 @@ def create_loan_in(
             date_value=payload.date,
             description=payload.description,
             attachment_url=payload.attachment_url,
-            metadata=payload.metadata,
+            metadata=metadata,
         ),
     )
 
@@ -339,10 +364,14 @@ def create_loan_in(
 def create_repayment_in(
     conn: Connection, *, user_id: str, payload: RepaymentInCreateRequest
 ) -> LedgerEntryIdResponse:
+    metadata = dict(payload.metadata or {})
+    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
+        txn_type="repayment_in",
+        transaction_id=metadata["transaction_id"],
         create_fn=lambda profile_id: create_repayment_in_entry(
             conn,
             user_id=user_id,
@@ -353,7 +382,7 @@ def create_repayment_in(
             date_value=payload.date,
             description=payload.description,
             attachment_url=payload.attachment_url,
-            metadata=payload.metadata,
+            metadata=metadata,
         ),
     )
 
@@ -361,10 +390,14 @@ def create_repayment_in(
 def create_repayment_out(
     conn: Connection, *, user_id: str, payload: RepaymentOutCreateRequest
 ) -> LedgerEntryIdResponse:
+    metadata = dict(payload.metadata or {})
+    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
+        txn_type="repayment_out",
+        transaction_id=metadata["transaction_id"],
         create_fn=lambda profile_id: create_repayment_out_entry(
             conn,
             user_id=user_id,
@@ -375,7 +408,7 @@ def create_repayment_out(
             date_value=payload.date,
             description=payload.description,
             attachment_url=payload.attachment_url,
-            metadata=payload.metadata,
+            metadata=metadata,
         ),
     )
 
