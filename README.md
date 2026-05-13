@@ -44,6 +44,10 @@ Set `.env` values:
 - `BUSINESS_CHAT_API_ENDPOINT` -> business AI upstream endpoint
 - `EMBEDDING_API_ENDPOINT` -> embedding endpoint for business vector retrieval (optional but recommended)
 - `EMBEDDING_MODEL_ID` / `EMBEDDING_DIM` -> must match vector schema settings
+- `RECEIPT_AWS_ACCESS_KEY_ID` / `RECEIPT_AWS_SECRET_ACCESS_KEY` -> required for `/api/v1/receipt` proxy
+- `RECEIPT_AWS_REGION` -> AWS region for Textract (default `us-east-1`)
+- `RECEIPT_TIMEOUT_SEC` -> receipt upstream timeout in seconds (default `30`)
+- `RECEIPT_TEXTRACT_ENDPOINT` -> optional explicit Textract endpoint override
 
 Apply latest Supabase migrations before using business AI routes:
 
@@ -52,6 +56,23 @@ Apply latest Supabase migrations before using business AI routes:
 - `supabase/migrations/202603090004_business_vector_objects_cutover.sql`
 
 Business vector indexing runs asynchronously in a backend worker loop at app startup.
+
+## Receipt Proxy Setup
+
+The mobile app can call backend receipt proxy endpoint:
+
+- `POST /api/v1/receipt`
+
+To enable it, set in `backend/.env`:
+
+- `RECEIPT_AWS_ACCESS_KEY_ID`
+- `RECEIPT_AWS_SECRET_ACCESS_KEY`
+- `RECEIPT_AWS_REGION` (optional, defaults to `us-east-1`)
+- `RECEIPT_AWS_SESSION_TOKEN` (optional, for temporary credentials)
+- `RECEIPT_TIMEOUT_SEC` (optional)
+- `RECEIPT_TEXTRACT_ENDPOINT` (optional override)
+
+After updating env values, restart the backend process.
 
 ## Run
 

@@ -51,6 +51,7 @@ class TransferCreateRequest(BaseModel):
     description: str | None = None
     attachment_url: str | None = None
     transaction_id: str | None = None
+    idempotency_key: str | None = None
     metadata: dict | None = None
 
 
@@ -62,6 +63,7 @@ class LoanOutCreateRequest(BaseModel):
     description: str | None = None
     attachment_url: str | None = None
     transaction_id: str | None = None
+    idempotency_key: str | None = None
     metadata: dict | None = None
 
 
@@ -73,6 +75,7 @@ class LoanInCreateRequest(BaseModel):
     description: str | None = None
     attachment_url: str | None = None
     transaction_id: str | None = None
+    idempotency_key: str | None = None
     metadata: dict | None = None
 
 
@@ -84,6 +87,7 @@ class RepaymentInCreateRequest(BaseModel):
     description: str | None = None
     attachment_url: str | None = None
     transaction_id: str | None = None
+    idempotency_key: str | None = None
     metadata: dict | None = None
 
 
@@ -95,4 +99,5 @@ class RepaymentOutCreateRequest(BaseModel):
     description: str | None = None
     attachment_url: str | None = None
     transaction_id: str | None = None
+    idempotency_key: str | None = None
     metadata: dict | None = None

@@ -72,14 +72,26 @@ def insert_category(
 
 
 def remove_category(conn: Connection, *, user_id: str, profile_id: str, category_id: str) -> None:
-    query = """
-    delete from public.categories
-    where id = %s::uuid
-      and user_id = %s::uuid
-      and profile_id = %s::uuid
-    """
     with conn.cursor() as cur:
-        cur.execute(query, (category_id, user_id, profile_id))
+        cur.execute(
+            """
+            update public.categories
+            set parent_id = null
+            where parent_id = %s::uuid
+              and user_id = %s::uuid
+              and profile_id = %s::uuid
+            """,
+            (category_id, user_id, profile_id),
+        )
+        cur.execute(
+            """
+            delete from public.categories
+            where id = %s::uuid
+              and user_id = %s::uuid
+              and profile_id = %s::uuid
+            """,
+            (category_id, user_id, profile_id),
+        )
 
 
 def upsert_default_categories(conn: Connection, *, user_id: str, profile_id: str) -> None:
@@ -101,4 +113,3 @@ def upsert_default_categories(conn: Connection, *, user_id: str, profile_id: str
     with conn.cursor() as cur:
         for name, cat_type, icon, color in defaults:
             cur.execute(query, (user_id, profile_id, name, cat_type, icon, color))
-

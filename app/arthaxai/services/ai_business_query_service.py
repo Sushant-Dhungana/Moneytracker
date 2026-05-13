@@ -10,9 +10,13 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 from psycopg import Connection
+from app.arthaxai.chat.neplish import detect_response_language_mode
+from app.services.summary_service import compile_business_summary_payload
 
 BusinessIntent = Literal[
     "monthly_report",
+    "sales_summary",
+    "purchase_summary",
     "customer_due",
     "supplier_due",
     "party_transactions",
@@ -176,6 +180,18 @@ REPORT_SCOPE_HINT_PATTERN = re.compile(
     r"\b(this month|last month|this week|last week|this year|last year|monthly)\b",
     re.IGNORECASE,
 )
+SALES_SUMMARY_HINT_PATTERN = re.compile(
+    r"\b(sale|sales|revenue)\b",
+    re.IGNORECASE,
+)
+PURCHASE_SUMMARY_HINT_PATTERN = re.compile(
+    r"\b(purchase|purchases|stock in|stock-in|inventory in)\b",
+    re.IGNORECASE,
+)
+SUMMARY_SCOPE_HINT_PATTERN = re.compile(
+    r"\b(today|yesterday|this week|last week|this month|last month|this year|last year|month|week|year|daily|total|how much|summary|report)\b",
+    re.IGNORECASE,
+)
 CUSTOMER_HINT_PATTERN = re.compile(r"\b(customer|customers|client|clients|receivable)\b", re.IGNORECASE)
 SUPPLIER_HINT_PATTERN = re.compile(r"\b(supplier|suppliers|vendor|vendors|payable)\b", re.IGNORECASE)
 CUSTOMER_DUE_PATTERN = re.compile(
@@ -214,6 +230,18 @@ STOCK_EXISTENCE_HINT_PATTERN = re.compile(
     r"\b(cha ki chaina|cha ki|stock ma cha|available|in stock|out of stock|cha|chaina)\b",
     re.IGNORECASE,
 )
+GENERIC_STOCK_OVERVIEW_PATTERN = re.compile(
+    r"\b(what products?(?: do)? i have(?: in stock)?|what are the products?(?: that)? i have(?: in stock)?|"
+    r"which products?(?: do)? i have(?: in stock)?|show (?:me )?(?:my )?(?:products?|stock|inventory)|"
+    r"stock list|inventory list|stock report|inventory report|stock summary|inventory summary|"
+    r"whole stock|all stock|full stock|complete stock|products? in stock|what is in stock)\b",
+    re.IGNORECASE,
+)
+PRODUCT_POSSESSION_QUANTITY_PATTERN = re.compile(
+    r"\b(how many\s+[a-z0-9][a-z0-9\s\-&\.]{1,80}\s+do i have|"
+    r"kati\s+[a-z0-9][a-z0-9\s\-&\.]{1,80}\s+cha)\b",
+    re.IGNORECASE,
+)
 SUPPLIER_HINT_PATTERN_STRONG = re.compile(
     r"\b(supplier|suppliers|vendor|vendors|payable|supplier lai|vendor lai|bata)\b",
     re.IGNORECASE,
@@ -244,6 +272,14 @@ NEP_ENGLISH_CUE_WORDS = _SHARED_NEPLISH_CUE_WORDS | _SHARED_NEPLISH_FINANCE_KEYW
 }
 
 ENTITY_PATTERN_TEMPLATES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bhow\s+many\s+(?P<entity>[a-z0-9][a-z0-9\s\-&\.]{1,80}?)\s+do\s+i\s+have(?:\s+in\s+my\s+data)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bkati\s+(?P<entity>[a-z0-9][a-z0-9\s\-&\.]{1,80}?)\s+cha\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(?P<entity>[a-z0-9][a-z0-9\s\-&\.]{1,80}?)\s+ko\s+stock\b", re.IGNORECASE),
     re.compile(
         r"\b(?P<entity>[a-z0-9][a-z0-9\s\-&\.]{1,80}?)\s+stock\s+ma\b", re.IGNORECASE
@@ -337,6 +373,39 @@ ENTITY_TOKEN_STOPWORDS = {
     "yo",
     "mahina",
     "hapta",
+    "general",
+    "recent",
+    "latest",
+    "all",
+    "full",
+    "complete",
+    "overview",
+    "statement",
+    "list",
+    "show",
+    "give",
+    "me",
+    "please",
+    "mine",
+    "own",
+    "what",
+    "which",
+    "are",
+    "is",
+    "do",
+    "did",
+    "i",
+    "have",
+    "has",
+    "in",
+    "on",
+    "from",
+    "that",
+    "data",
+    "full",
+    "all",
+    "entire",
+    "total",
 }
 
 LOW_STOCK_THRESHOLD = 5
@@ -399,6 +468,39 @@ PARTY_NAME_STOPWORDS = {
     "paila",
     "mero",
     "my",
+    "general",
+    "recent",
+    "latest",
+    "all",
+    "full",
+    "complete",
+    "overview",
+    "statement",
+    "list",
+    "show",
+    "give",
+    "me",
+    "please",
+    "mine",
+    "own",
+    "what",
+    "which",
+    "are",
+    "is",
+    "do",
+    "did",
+    "i",
+    "have",
+    "has",
+    "in",
+    "on",
+    "from",
+    "that",
+    "data",
+    "full",
+    "all",
+    "entire",
+    "total",
 }
 
 
@@ -421,6 +523,7 @@ class BusinessQueryUnderstanding:
     party_name_candidates: list[str]
     expects_customer: bool
     expects_supplier: bool
+    response_language_mode: Literal["english", "neplish", "nepali"]
     neplish_style: bool
 
 
@@ -515,11 +618,7 @@ def _extract_entity_text_candidates(raw_query: str) -> list[str]:
 
 
 def _looks_neplish_style(query: str) -> bool:
-    normalized = _normalize_for_match(query or "")
-    if not normalized:
-        return False
-    tokens = set(normalized.split())
-    return bool(tokens & NEP_ENGLISH_CUE_WORDS)
+    return detect_response_language_mode(query) == "neplish"
 
 
 def normalize_neplish_business_query(
@@ -632,6 +731,10 @@ def _infer_entity_type_hint(normalized_query: str) -> EntityTypeHint:
         product_score += 3
     if LOW_STOCK_HINT_PATTERN.search(normalized_query):
         product_score += 2
+    if GENERIC_STOCK_OVERVIEW_PATTERN.search(normalized_query):
+        product_score += 3
+    if PRODUCT_POSSESSION_QUANTITY_PATTERN.search(normalized_query):
+        product_score += 3
 
     if CUSTOMER_HINT_PATTERN_STRONG.search(normalized_query):
         customer_score += 3
@@ -668,6 +771,22 @@ def _detect_intent(normalized_query: str, *, entity_type_hint: EntityTypeHint) -
     if not normalized_query:
         return "fallback"
 
+    if (
+        SALES_SUMMARY_HINT_PATTERN.search(normalized_query)
+        and not PRICE_HINT_PATTERN.search(normalized_query)
+        and SUMMARY_SCOPE_HINT_PATTERN.search(normalized_query)
+    ):
+        return "sales_summary"
+
+    if (
+        PURCHASE_SUMMARY_HINT_PATTERN.search(normalized_query)
+        and SUMMARY_SCOPE_HINT_PATTERN.search(normalized_query)
+    ):
+        return "purchase_summary"
+
+    if any(token in normalized_query for token in ["income", "expense"]):
+        return "monthly_report"
+
     if TRANSACTION_HINT_PATTERN.search(normalized_query):
         return "party_transactions"
 
@@ -677,6 +796,10 @@ def _detect_intent(normalized_query: str, *, entity_type_hint: EntityTypeHint) -
         return "supplier_purchase_total"
     if INVOICE_DUE_PATTERN.search(normalized_query):
         return "customer_invoice_due_lookup"
+    if GENERIC_STOCK_OVERVIEW_PATTERN.search(normalized_query):
+        return "stock_existence"
+    if PRODUCT_POSSESSION_QUANTITY_PATTERN.search(normalized_query):
+        return "stock_quantity_lookup"
 
     if STOCK_HINT_PATTERN.search(normalized_query) or entity_type_hint == "product":
         if PRICE_HINT_PATTERN.search(normalized_query):
@@ -760,6 +883,7 @@ def parse_business_query_understanding(
     expects_supplier = bool(SUPPLIER_HINT_PATTERN_STRONG.search(normalized_query)) or bool(
         SUPPLIER_DUE_PATTERN.search(normalized_query)
     ) or intent == "supplier_purchase_total"
+    response_language_mode = detect_response_language_mode(raw_query)
 
     if (
         intent in {"customer_due", "supplier_due"}
@@ -780,7 +904,8 @@ def parse_business_query_understanding(
         party_name_candidates=entity_text_candidates,
         expects_customer=expects_customer,
         expects_supplier=expects_supplier,
-        neplish_style=_looks_neplish_style(raw_query),
+        response_language_mode=response_language_mode,
+        neplish_style=response_language_mode == "neplish",
     )
 
 
@@ -870,6 +995,66 @@ def _rank_entity_matches(
     return ranked
 
 
+def _find_product_family_matches(
+    understanding: BusinessQueryUnderstanding,
+    *,
+    products: Sequence[dict],
+    min_score: float = 0.72,
+) -> tuple[list[dict], str | None]:
+    candidates = understanding.entity_text_candidates or _extract_entity_text_candidates(
+        understanding.normalized_query
+    )
+    if not candidates:
+        return [], None
+
+    normalized_candidates = [
+        _normalize_for_match(candidate)
+        for candidate in candidates
+        if _normalize_for_match(candidate)
+    ]
+    if not normalized_candidates:
+        return [], None
+
+    family_label = max(normalized_candidates, key=len)
+    matches: list[tuple[float, dict]] = []
+    for row in products:
+        entity_name = str(row.get("name") or "").strip()
+        entity_norm = _normalize_for_match(entity_name)
+        if not entity_norm:
+            continue
+        best_score = 0.0
+        contains_candidate = False
+        for candidate_norm in normalized_candidates:
+            score = _score_entity_match(
+                candidate_norm,
+                entity_name,
+                normalized_query=understanding.normalized_query,
+            )
+            best_score = max(best_score, score)
+            if candidate_norm and candidate_norm in entity_norm:
+                contains_candidate = True
+        if best_score >= min_score and contains_candidate:
+            matches.append((best_score, row))
+
+    matches.sort(
+        key=lambda item: (
+            -item[0],
+            -(_as_float(item[1].get("qty_on_hand")) or 0.0),
+            str(item[1].get("name") or "").lower(),
+        )
+    )
+    deduped: list[dict] = []
+    seen_ids: set[str] = set()
+    for _, row in matches:
+        row_id = str(row.get("id") or "").strip()
+        if row_id and row_id in seen_ids:
+            continue
+        if row_id:
+            seen_ids.add(row_id)
+        deduped.append(row)
+    return deduped, family_label
+
+
 def _pick_best_match(
     ranked: Sequence[EntityMatch],
     *,
@@ -908,6 +1093,7 @@ def _build_ambiguous_prompt(
             understanding,
             en=f"I found multiple close product matches: {names}. Please specify the exact product name.",
             np=f"Maile dherai milne product haru paye: {names}. Kripaya exact product name dinuhos.",
+            ne=f"मैले धेरै मिल्ने प्रोडक्टहरू भेट्टाएँ: {names}. कृपया ठ्याक्कै प्रोडक्ट नाम दिनुहोस्।",
         )
 
     if intent in {"customer_due", "customer_purchase_total", "customer_invoice_due_lookup"}:
@@ -916,6 +1102,7 @@ def _build_ambiguous_prompt(
             understanding,
             en=f"I found multiple close customer matches: {names}. Please specify the exact customer name.",
             np=f"Maile dherai milne customer haru paye: {names}. Kripaya exact customer name dinuhos.",
+            ne=f"मैले धेरै मिल्ने ग्राहकहरू भेट्टाएँ: {names}. कृपया ठ्याक्कै ग्राहक नाम दिनुहोस्।",
         )
 
     if intent in {"supplier_due", "supplier_purchase_total"}:
@@ -924,6 +1111,7 @@ def _build_ambiguous_prompt(
             understanding,
             en=f"I found multiple close supplier matches: {names}. Please specify the exact supplier name.",
             np=f"Maile dherai milne supplier haru paye: {names}. Kripaya exact supplier name dinuhos.",
+            ne=f"मैले धेरै मिल्ने सप्लायरहरू भेट्टाएँ: {names}. कृपया ठ्याक्कै सप्लायर नाम दिनुहोस्।",
         )
 
     names: list[str] = []
@@ -936,6 +1124,7 @@ def _build_ambiguous_prompt(
         understanding,
         en=f"I found multiple close party matches ({joined}). Please clarify the exact name.",
         np=f"Maile customer/supplier list ma dherai milne naam paye ({joined}). Kripaya exact naam clear garnuhos.",
+        ne=f"मैले customer/supplier सूचीमा धेरै मिल्ने नामहरू भेट्टाएँ ({joined}). कृपया ठ्याक्कै नाम स्पष्ट गर्नुहोस्।",
     )
 
 
@@ -1230,6 +1419,32 @@ def _fetch_active_products(
     user_id: str,
     profile_id: str,
 ) -> list[dict]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  id::text as id,
+                  coalesce(nullif(trim(name), ''), 'Product') as name,
+                  quantity as qty_on_hand,
+                  price as base_price,
+                  price as selling_price,
+                  0::numeric as avg_unit_cost,
+                  coalesce(unit_name, '') as unit_name,
+                  coalesce(category_name, '') as category_name
+                from public.list_business_products(%(profile_id)s::uuid)
+                where user_id = %(user_id)s::uuid
+                  and is_active = true
+                order by lower(name), id::text
+                """,
+                {"user_id": user_id, "profile_id": profile_id},
+            )
+            rows = cur.fetchall() or []
+        if rows:
+            return rows
+    except Exception:
+        pass
+
     products_relation = _first_existing_relation(conn, ["business.products", "public.products"])
     if not products_relation:
         return []
@@ -1282,7 +1497,9 @@ def _fetch_active_products(
               {qty_expr} as qty_on_hand,
               {selling_price_expr} as selling_price,
               {base_price_expr} as base_price,
-              {avg_cost_expr} as avg_unit_cost
+              {avg_cost_expr} as avg_unit_cost,
+              ''::text as unit_name,
+              ''::text as category_name
             from {products_relation} p
             {join_stock_state}
             where p.user_id = %(user_id)s::uuid
@@ -1302,8 +1519,18 @@ def _to_money_or_na(value: float | None) -> str:
     return _money(value)
 
 
-def _neplish_phrase(understanding: BusinessQueryUnderstanding, *, en: str, np: str) -> str:
-    return np if understanding.neplish_style else en
+def _neplish_phrase(
+    understanding: BusinessQueryUnderstanding,
+    *,
+    en: str,
+    np: str,
+    ne: str | None = None,
+) -> str:
+    if understanding.response_language_mode == "nepali":
+        return ne or np
+    if understanding.response_language_mode == "neplish":
+        return np
+    return en
 
 
 def _as_float(value: object) -> float | None:
@@ -1334,6 +1561,15 @@ def _monthly_report_reply(
         conn,
         ["business.ledger_entries", "public.ledger_entries"],
     )
+    categories_relation = _first_existing_relation(
+        conn,
+        [
+            "business.business_categories",
+            "public.business_categories",
+            "business.categories",
+            "public.categories",
+        ],
+    )
     if not postings_relation or not entries_relation:
         return None
 
@@ -1342,32 +1578,19 @@ def _monthly_report_reply(
     end = scope.end if scope and scope.end else today
     as_of = min(today, end)
     period_label = scope.label if scope else "this month"
+    period_totals = compile_business_summary_payload(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        period="range",
+        from_date=start,
+        to_date=end,
+        include_due_snapshot=False,
+        emit_diagnostics=False,
+        validate_profile=False,
+    )
 
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            select
-              coalesce(sum(case
-                when lp.leg_type in ('sales_revenue','income_bucket') and lp.direction='credit'
-                then lp.amount else 0 end), 0) as income_total,
-              coalesce(sum(case
-                when lp.leg_type in ('cogs','expense_bucket') and lp.direction='debit'
-                then lp.amount else 0 end), 0) as expense_total
-            from {postings_relation} lp
-            join {entries_relation} le on le.id = lp.entry_id
-            where lp.user_id = %(user_id)s::uuid
-              and lp.profile_id = %(profile_id)s::uuid
-              and le.date between %(start_date)s and %(end_date)s
-            """,
-            {
-                "user_id": user_id,
-                "profile_id": profile_id,
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-            },
-        )
-        period_totals = cur.fetchone() or {}
-
         cur.execute(
             f"""
             select
@@ -1405,24 +1628,78 @@ def _monthly_report_reply(
         )
         due_totals = cur.fetchone() or {}
 
-    income_total = float(period_totals.get("income_total") or 0)
-    expense_total = float(period_totals.get("expense_total") or 0)
-    net_total = income_total - expense_total
+    income_total = float(period_totals.get("income") or 0)
+    expense_total = float(period_totals.get("expense") or 0)
+    net_total = float(period_totals.get("net") or (income_total - expense_total))
     receivable_due = max(0.0, float(due_totals.get("receivable_due") or 0))
     payable_due = max(0.0, float(due_totals.get("payable_due") or 0))
 
+    income_categories: list[tuple[str, float]] = []
+    expense_categories: list[tuple[str, float]] = []
+    if categories_relation:
+        date_filter = ""
+        bind = {"user_id": user_id, "profile_id": profile_id}
+        if start:
+            date_filter += " and le.date >= %(from_date)s"
+            bind["from_date"] = start.isoformat()
+        if end:
+            date_filter += " and le.date <= %(to_date)s"
+            bind["to_date"] = end.isoformat()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select
+                  c.id::text as category_id,
+                  coalesce(nullif(trim(c.name), ''), 'Category') as category_name,
+                  coalesce(sum(case when lp.leg_type = 'income_bucket' and lp.direction='credit' then lp.amount else 0 end), 0) as income_total,
+                  coalesce(sum(case when lp.leg_type = 'expense_bucket' and lp.direction='debit' then lp.amount else 0 end), 0) as expense_total
+                from {postings_relation} lp
+                join {entries_relation} le on le.id = lp.entry_id
+                join {categories_relation} c on c.id = lp.ref_id
+                where lp.user_id = %(user_id)s::uuid
+                  and lp.profile_id = %(profile_id)s::uuid
+                  and lp.leg_type in ('income_bucket', 'expense_bucket')
+                  {date_filter}
+                group by c.id, c.name
+                """,
+                bind,
+            )
+            rows = cur.fetchall() or []
+
+        for row in rows:
+            name = str(row.get("category_name") or "").strip() or "Category"
+            income_value = float(row.get("income_total") or 0)
+            expense_value = float(row.get("expense_total") or 0)
+            if income_value > 0:
+                income_categories.append((name, income_value))
+            if expense_value > 0:
+                expense_categories.append((name, expense_value))
+
+        income_categories.sort(key=lambda item: item[1], reverse=True)
+        expense_categories.sort(key=lambda item: item[1], reverse=True)
+
     summary = "profit" if net_total >= 0 else "loss"
-    return "\n".join(
-        [
-            f"Business report for {period_label} ({start.isoformat()} to {end.isoformat()}):",
-            f"- Income: {_money(income_total)}",
-            f"- Expense: {_money(expense_total)}",
-            f"- Net: {_money(net_total)}",
-            f"- Receivable due: {_money(receivable_due)}",
-            f"- Payable due: {_money(payable_due)}",
-            f"Summary: {summary.title()} {_money(abs(net_total))}. As of {as_of.isoformat()}.",
-        ]
-    )
+    lines = [
+        f"Business report for {period_label} ({start.isoformat()} to {end.isoformat()}):",
+        f"- Income: {_money(income_total)}",
+        f"- Expense: {_money(expense_total)}",
+        f"- Net: {_money(net_total)}",
+        f"- Receivable due: {_money(receivable_due)}",
+        f"- Payable due: {_money(payable_due)}",
+    ]
+
+    if income_categories:
+        lines.append("Income by category:")
+        for name, amount in income_categories[:5]:
+            lines.append(f"- {name}: {_money(amount)}")
+    if expense_categories:
+        lines.append("Expense by category:")
+        for name, amount in expense_categories[:5]:
+            lines.append(f"- {name}: {_money(amount)}")
+
+    lines.append(f"Summary: {summary.title()} {_money(abs(net_total))}. As of {as_of.isoformat()}.")
+    return "\n".join(lines)
 
 
 def _party_due_reply(
@@ -1646,15 +1923,23 @@ def _product_stock_quantity_reply(
 ) -> str:
     product_name = str(product.get("name") or "Product").strip() or "Product"
     qty = _as_float(product.get("qty_on_hand")) or 0.0
+    unit_name = str(product.get("unit_name") or "").strip()
+    qty_label = f"{qty:.3f} {unit_name}".strip()
     status_line = _neplish_phrase(
         understanding,
-        en=f"{product_name} stock quantity is {qty:.3f}.",
-        np=f"{product_name} ko stock {qty:.3f} cha.",
+        en=f"{product_name} stock quantity is {qty_label}.",
+        np=f"{product_name} ko stock {qty_label} cha.",
+        ne=f"{product_name} को स्टक {qty_label} छ।",
     )
     return "\n".join(
         [
             status_line,
-            f"Summary: As of {date.today().isoformat()}.",
+            _neplish_phrase(
+                understanding,
+                en=f"Summary: As of {date.today().isoformat()}.",
+                np=f"Summary: {date.today().isoformat()} samma.",
+                ne=f"सारांश: {date.today().isoformat()} सम्म।",
+            ),
         ]
     )
 
@@ -1666,19 +1951,199 @@ def _product_stock_existence_reply(
 ) -> str:
     product_name = str(product.get("name") or "Product").strip() or "Product"
     qty = _as_float(product.get("qty_on_hand")) or 0.0
+    unit_name = str(product.get("unit_name") or "").strip()
+    qty_label = f"{qty:.3f} {unit_name}".strip()
     if qty <= 0:
         line = _neplish_phrase(
             understanding,
             en=f"{product_name} is out of stock.",
             np=f"{product_name} stock chaina.",
+            ne=f"{product_name} स्टकमा छैन।",
         )
     else:
         line = _neplish_phrase(
             understanding,
-            en=f"{product_name} is in stock ({qty:.3f}).",
-            np=f"{product_name} stock ma cha ({qty:.3f}).",
+            en=f"{product_name} is in stock ({qty_label}).",
+            np=f"{product_name} stock ma cha ({qty_label}).",
+            ne=f"{product_name} स्टकमा छ ({qty_label})।",
         )
-    return "\n".join([line, f"Summary: As of {date.today().isoformat()}."])
+    return "\n".join(
+        [
+            line,
+            _neplish_phrase(
+                understanding,
+                en=f"Summary: As of {date.today().isoformat()}.",
+                np=f"Summary: {date.today().isoformat()} samma.",
+                ne=f"सारांश: {date.today().isoformat()} सम्म।",
+            ),
+        ]
+    )
+
+
+def _inventory_overview_reply(
+    understanding: BusinessQueryUnderstanding,
+    *,
+    products: Sequence[dict],
+) -> str:
+    in_stock_rows = [
+        row for row in products if (_as_float(row.get("qty_on_hand")) or 0.0) > 0
+    ]
+    if not in_stock_rows:
+        line = _neplish_phrase(
+            understanding,
+            en="You do not have any products in stock right now.",
+            np="Tapai sanga ahile stock ma kunai product chaina.",
+            ne="तपाईंको स्टकमा अहिले कुनै पनि प्रोडक्ट छैन।",
+        )
+        return "\n".join(
+            [
+                line,
+                _neplish_phrase(
+                    understanding,
+                    en=f"Summary: As of {date.today().isoformat()}.",
+                    np=f"Summary: {date.today().isoformat()} samma.",
+                    ne=f"सारांश: {date.today().isoformat()} सम्म।",
+                ),
+            ]
+        )
+
+    in_stock_rows = sorted(
+        in_stock_rows,
+        key=lambda row: (
+            -(_as_float(row.get("qty_on_hand")) or 0.0),
+            str(row.get("name") or "").lower(),
+        ),
+    )
+    total_products = len(in_stock_rows)
+    total_units = sum((_as_float(row.get("qty_on_hand")) or 0.0) for row in in_stock_rows)
+    lines = [
+        _neplish_phrase(
+            understanding,
+            en=f"You have {total_products} products currently in stock.",
+            np=f"Tapai sanga ahile stock ma {total_products} ota product chan.",
+            ne=f"तपाईंको स्टकमा अहिले {total_products} वटा प्रोडक्ट छन्।",
+        ),
+        _neplish_phrase(
+            understanding,
+            en=f"- Total units on hand: {total_units:.3f}",
+            np=f"- Total units on hand: {total_units:.3f}",
+            ne=f"- कुल परिमाण: {total_units:.3f}",
+        ),
+        _neplish_phrase(
+            understanding,
+            en="In-stock products:",
+            np="In-stock products:",
+            ne="स्टकमा रहेका प्रोडक्टहरू:",
+        ),
+    ]
+    for row in in_stock_rows[:12]:
+        product_name = str(row.get("name") or "Product").strip() or "Product"
+        qty = _as_float(row.get("qty_on_hand")) or 0.0
+        unit_name = str(row.get("unit_name") or "").strip()
+        lines.append(f"- {product_name}: {f'{qty:.3f} {unit_name}'.strip()}")
+    if total_products > 12:
+        lines.append(
+            _neplish_phrase(
+                understanding,
+                en=f"- Plus {total_products - 12} more products in stock.",
+                np=f"- Aru {total_products - 12} ota product pani stock ma chan.",
+                ne=f"- थप {total_products - 12} वटा प्रोडक्ट पनि स्टकमा छन्।",
+            )
+        )
+    lines.append(
+        _neplish_phrase(
+            understanding,
+            en=f"Summary: As of {date.today().isoformat()}.",
+            np=f"Summary: {date.today().isoformat()} samma.",
+            ne=f"सारांश: {date.today().isoformat()} सम्म।",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _product_family_stock_reply(
+    understanding: BusinessQueryUnderstanding,
+    *,
+    family_label: str,
+    products: Sequence[dict],
+) -> str:
+    normalized_label = str(family_label or "").strip() or "matching"
+    in_stock_rows = [
+        row for row in products if (_as_float(row.get("qty_on_hand")) or 0.0) > 0
+    ]
+    total_products = len(products)
+    total_in_stock = len(in_stock_rows)
+    total_units = sum((_as_float(row.get("qty_on_hand")) or 0.0) for row in in_stock_rows)
+    display_label = normalized_label.title()
+
+    if total_in_stock == 0:
+        line = _neplish_phrase(
+            understanding,
+            en=f"You have {total_products} different {normalized_label} products in your data, but none are currently in stock.",
+            np=f"Tapai ko data ma {total_products} ota farak {normalized_label} product chan, tara ahile stock ma chainan.",
+            ne=f"तपाईंको डाटामा {total_products} वटा फरक {normalized_label} प्रोडक्ट छन्, तर अहिले कुनै पनि स्टकमा छैनन्।",
+        )
+        return "\n".join(
+            [
+                line,
+                _neplish_phrase(
+                    understanding,
+                    en=f"Summary: As of {date.today().isoformat()}.",
+                    np=f"Summary: {date.today().isoformat()} samma.",
+                    ne=f"सारांश: {date.today().isoformat()} सम्म।",
+                ),
+            ]
+        )
+
+    lines = [
+        _neplish_phrase(
+            understanding,
+            en=f"You have {total_products} different {normalized_label} products in your data. {total_in_stock} are currently in stock.",
+            np=f"Tapai ko data ma {total_products} ota farak {normalized_label} product chan. Tes madhye {total_in_stock} ota ahile stock ma chan.",
+            ne=f"तपाईंको डाटामा {total_products} वटा फरक {normalized_label} प्रोडक्ट छन्। तीमध्ये {total_in_stock} वटा अहिले स्टकमा छन्।",
+        ),
+        _neplish_phrase(
+            understanding,
+            en=f"- Total {display_label} units in stock: {total_units:.3f}",
+            np=f"- Total {display_label} units in stock: {total_units:.3f}",
+            ne=f"- स्टकमा रहेको कुल {display_label} परिमाण: {total_units:.3f}",
+        ),
+        _neplish_phrase(
+            understanding,
+            en=f"{display_label} products in stock:",
+            np=f"{display_label} products in stock:",
+            ne=f"स्टकमा रहेका {display_label} प्रोडक्टहरू:",
+        ),
+    ]
+    for row in sorted(
+        in_stock_rows,
+        key=lambda item: (
+            -(_as_float(item.get("qty_on_hand")) or 0.0),
+            str(item.get("name") or "").lower(),
+        ),
+    )[:12]:
+        product_name = str(row.get("name") or "Product").strip() or "Product"
+        qty = _as_float(row.get("qty_on_hand")) or 0.0
+        unit_name = str(row.get("unit_name") or "").strip()
+        lines.append(f"- {product_name}: {f'{qty:.3f} {unit_name}'.strip()}")
+    if total_in_stock > 12:
+        lines.append(
+            _neplish_phrase(
+                understanding,
+                en=f"- Plus {total_in_stock - 12} more matching products in stock.",
+                np=f"- Aru {total_in_stock - 12} ota matching product pani stock ma chan.",
+                ne=f"- थप {total_in_stock - 12} वटा मिल्ने प्रोडक्ट पनि स्टकमा छन्।",
+            )
+        )
+    lines.append(
+        _neplish_phrase(
+            understanding,
+            en=f"Summary: As of {date.today().isoformat()}.",
+            np=f"Summary: {date.today().isoformat()} samma.",
+            ne=f"सारांश: {date.today().isoformat()} सम्म।",
+        )
+    )
+    return "\n".join(lines)
 
 
 def _product_price_reply(
@@ -1720,20 +2185,39 @@ def _product_low_stock_reply(
             understanding,
             en=f"{product_name} is out of stock.",
             np=f"{product_name} stock chaina.",
+            ne=f"{product_name} स्टकमा छैन।",
         )
     elif qty <= LOW_STOCK_THRESHOLD:
         line = _neplish_phrase(
             understanding,
             en=f"{product_name} has low stock.",
             np=f"{product_name} low stock ma cha.",
+            ne=f"{product_name} को स्टक कम छ।",
         )
     else:
         line = _neplish_phrase(
             understanding,
             en=f"{product_name} is not in low stock.",
             np=f"{product_name} low stock ma chaina.",
+            ne=f"{product_name} को स्टक कम छैन।",
         )
-    return "\n".join([line, f"- Current qty: {qty:.3f}", f"Summary: As of {date.today().isoformat()}."])
+    return "\n".join(
+        [
+            line,
+            _neplish_phrase(
+                understanding,
+                en=f"- Current qty: {qty:.3f}",
+                np=f"- Current qty: {qty:.3f}",
+                ne=f"- हालको परिमाण: {qty:.3f}",
+            ),
+            _neplish_phrase(
+                understanding,
+                en=f"Summary: As of {date.today().isoformat()}.",
+                np=f"Summary: {date.today().isoformat()} samma.",
+                ne=f"सारांश: {date.today().isoformat()} सम्म।",
+            ),
+        ]
+    )
 
 
 def _customer_purchase_total_reply(
@@ -2015,6 +2499,202 @@ def _supplier_purchase_total_reply(
     )
 
 
+def _supplier_product_purchase_reply(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    supplier: EntityMatch,
+    product: EntityMatch,
+    scope: ParsedDateScope | None,
+) -> str | None:
+    entries_relation = _first_existing_relation(conn, ["business.ledger_entries", "public.ledger_entries"])
+    if not entries_relation:
+        return None
+    has_metadata = _relation_has_column(conn, entries_relation, "metadata")
+    has_txn_type = _relation_has_column(conn, entries_relation, "txn_type")
+    has_date_col = _relation_has_column(conn, entries_relation, "date")
+    if not has_metadata or not has_txn_type:
+        return None
+
+    date_filter_sql = ""
+    bind: dict[str, object] = {
+        "user_id": user_id,
+        "profile_id": profile_id,
+        "supplier_id": supplier.id,
+        "supplier_name_norm": supplier.normalized_name,
+        "product_id": product.id,
+        "product_name_norm": product.normalized_name,
+    }
+    if scope and not scope.all_time and scope.start and scope.end and has_date_col:
+        date_filter_sql = "and le.date between %(start_date)s and %(end_date)s"
+        bind["start_date"] = scope.start.isoformat()
+        bind["end_date"] = scope.end.isoformat()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              coalesce(count(*), 0)::int as purchase_entry_count,
+              coalesce(sum(coalesce(le.amount, 0)), 0) as purchase_total,
+              coalesce(
+                sum(
+                  case
+                    when nullif(le.metadata->>'qty', '') is null then 0
+                    else (le.metadata->>'qty')::numeric
+                  end
+                ),
+                0
+              ) as total_qty,
+              max(le.date)::text as last_purchase_date
+            from {entries_relation} le
+            where le.user_id = %(user_id)s::uuid
+              and le.profile_id = %(profile_id)s::uuid
+              and le.txn_type in ('inventory_in', 'stock_in', 'purchase')
+              and (
+                nullif(le.metadata->>'supplier_id', '') = %(supplier_id)s
+                or lower(trim(coalesce(le.metadata->>'supplier_name', ''))) = %(supplier_name_norm)s
+              )
+              and (
+                nullif(le.metadata->>'product_id', '') = %(product_id)s
+                or lower(trim(coalesce(le.metadata->>'product_name', ''))) = %(product_name_norm)s
+              )
+              {date_filter_sql}
+            """,
+            bind,
+        )
+        row = cur.fetchone() or {}
+
+    purchase_entry_count = int(row.get("purchase_entry_count") or 0)
+    purchase_total = float(row.get("purchase_total") or 0)
+    total_qty = float(row.get("total_qty") or 0)
+    last_purchase_date = str(row.get("last_purchase_date") or "").strip() or "Not available"
+    scope_label = scope.label if scope else "all time"
+
+    return "\n".join(
+        [
+            f"Purchase summary for {product.name} from {supplier.name} ({scope_label}):",
+            f"- Purchase entries: {purchase_entry_count}",
+            f"- Total quantity purchased: {total_qty:.3f}",
+            f"- Total purchase amount: {_money(purchase_total)}",
+            f"- Last purchase date: {last_purchase_date}",
+            f"Summary: As of {date.today().isoformat()}.",
+        ]
+    )
+
+
+def _sales_summary_reply(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    scope: ParsedDateScope | None,
+) -> str | None:
+    entries_relation = _first_existing_relation(
+        conn,
+        ["business.ledger_entries", "public.ledger_entries"],
+    )
+    if not entries_relation:
+        return None
+
+    today = date.today()
+    resolved_scope = scope or ParsedDateScope(label="today", start=today, end=today)
+    scope_label = resolved_scope.label if resolved_scope else "today"
+
+    date_filter = ""
+    bind = {"user_id": user_id, "profile_id": profile_id}
+    if not resolved_scope.all_time and resolved_scope.start and resolved_scope.end:
+        date_filter = "and le.date between %(start_date)s and %(end_date)s"
+        bind["start_date"] = resolved_scope.start.isoformat()
+        bind["end_date"] = resolved_scope.end.isoformat()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              coalesce(sum(le.amount), 0) as sales_total,
+              coalesce(count(*), 0)::int as sales_count,
+              max(le.date)::text as last_sale_date
+            from {entries_relation} le
+            where le.user_id = %(user_id)s::uuid
+              and le.profile_id = %(profile_id)s::uuid
+              and le.txn_type = 'sale'
+              {date_filter}
+            """,
+            bind,
+        )
+        row = cur.fetchone() or {}
+
+    sales_total = float(row.get("sales_total") or 0)
+    sales_count = int(row.get("sales_count") or 0)
+    last_sale_date = str(row.get("last_sale_date") or "").strip() or "Not available"
+
+    return "\n".join(
+        [
+            f"Sales summary ({scope_label}):",
+            f"- Total sales: {_money(sales_total)}",
+            f"- Sale entries: {sales_count}",
+            f"- Last sale date: {last_sale_date}",
+        ]
+    )
+
+
+def _purchase_summary_reply(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    scope: ParsedDateScope | None,
+) -> str | None:
+    entries_relation = _first_existing_relation(
+        conn,
+        ["business.ledger_entries", "public.ledger_entries"],
+    )
+    if not entries_relation:
+        return None
+
+    today = date.today()
+    resolved_scope = scope or ParsedDateScope(label="today", start=today, end=today)
+    scope_label = resolved_scope.label if resolved_scope else "today"
+
+    date_filter = ""
+    bind = {"user_id": user_id, "profile_id": profile_id}
+    if not resolved_scope.all_time and resolved_scope.start and resolved_scope.end:
+        date_filter = "and le.date between %(start_date)s and %(end_date)s"
+        bind["start_date"] = resolved_scope.start.isoformat()
+        bind["end_date"] = resolved_scope.end.isoformat()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              coalesce(sum(le.amount), 0) as purchase_total,
+              coalesce(count(*), 0)::int as purchase_count,
+              max(le.date)::text as last_purchase_date
+            from {entries_relation} le
+            where le.user_id = %(user_id)s::uuid
+              and le.profile_id = %(profile_id)s::uuid
+              and le.txn_type in ('inventory_in', 'stock_in')
+              {date_filter}
+            """,
+            bind,
+        )
+        row = cur.fetchone() or {}
+
+    purchase_total = float(row.get("purchase_total") or 0)
+    purchase_count = int(row.get("purchase_count") or 0)
+    last_purchase_date = str(row.get("last_purchase_date") or "").strip() or "Not available"
+
+    return "\n".join(
+        [
+            f"Purchase summary ({scope_label}):",
+            f"- Total purchase: {_money(purchase_total)}",
+            f"- Purchase entries: {purchase_count}",
+            f"- Last purchase date: {last_purchase_date}",
+        ]
+    )
+
+
 def _not_found_reply(understanding: BusinessQueryUnderstanding, expected: str) -> str:
     missing_name = (
         understanding.entity_text_candidates[0].strip()
@@ -2050,6 +2730,50 @@ def try_generate_deterministic_business_response(
 
     if understanding.intent == "monthly_report":
         reply = _monthly_report_reply(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            scope=understanding.scope,
+        )
+        if not reply:
+            return DeterministicBusinessChatResult(
+                handled=False,
+                route="llm_fallback",
+                intent=understanding.intent,
+                resolution_status="fallback",
+            )
+        return DeterministicBusinessChatResult(
+            handled=True,
+            route="deterministic",
+            intent=understanding.intent,
+            resolution_status="resolved",
+            reply=reply,
+        )
+
+    if understanding.intent == "sales_summary":
+        reply = _sales_summary_reply(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            scope=understanding.scope,
+        )
+        if not reply:
+            return DeterministicBusinessChatResult(
+                handled=False,
+                route="llm_fallback",
+                intent=understanding.intent,
+                resolution_status="fallback",
+            )
+        return DeterministicBusinessChatResult(
+            handled=True,
+            route="deterministic",
+            intent=understanding.intent,
+            resolution_status="resolved",
+            reply=reply,
+        )
+
+    if understanding.intent == "purchase_summary":
+        reply = _purchase_summary_reply(
             conn,
             user_id=user_id,
             profile_id=profile_id,
@@ -2106,6 +2830,58 @@ def try_generate_deterministic_business_response(
         )
 
     selected_entity = resolution.selected
+    if understanding.intent in {
+        "stock_quantity_lookup",
+        "stock_existence",
+        "product_price_lookup",
+        "low_stock_check",
+    }:
+        family_products, family_label = _find_product_family_matches(
+            understanding,
+            products=products,
+        )
+        if family_label and len(family_products) >= 2:
+            return DeterministicBusinessChatResult(
+                handled=True,
+                route="deterministic",
+                intent=understanding.intent,
+                entity_type="product",
+                entity_match_confidence=resolution.confidence,
+                resolution_status="resolved",
+                reply=_product_family_stock_reply(
+                    understanding,
+                    family_label=family_label,
+                    products=family_products,
+                ),
+            )
+    if (
+        understanding.intent in {"stock_quantity_lookup", "stock_existence"}
+        and not selected_entity
+        and GENERIC_STOCK_OVERVIEW_PATTERN.search(understanding.normalized_query)
+    ):
+        return DeterministicBusinessChatResult(
+            handled=True,
+            route="deterministic",
+            intent=understanding.intent,
+            entity_type="product",
+            entity_match_confidence=resolution.confidence,
+            resolution_status="resolved",
+            reply=_inventory_overview_reply(understanding, products=products),
+        )
+    if (
+        understanding.intent == "party_transactions"
+        and not selected_entity
+        and not understanding.expects_customer
+        and not understanding.expects_supplier
+        and not understanding.entity_text_candidates
+    ):
+        return DeterministicBusinessChatResult(
+            handled=False,
+            route="llm_fallback",
+            intent=understanding.intent,
+            resolution_status="fallback",
+        )
+
     if not selected_entity and understanding.intent in {
         "stock_quantity_lookup",
         "stock_existence",
@@ -2272,6 +3048,25 @@ def try_generate_deterministic_business_response(
         )
 
     if understanding.intent == "supplier_purchase_total" and selected_entity.kind == "supplier":
+        if resolution.product:
+            supplier_product_purchase_reply = _supplier_product_purchase_reply(
+                conn,
+                user_id=user_id,
+                profile_id=profile_id,
+                supplier=selected_entity,
+                product=resolution.product,
+                scope=understanding.scope,
+            )
+            if supplier_product_purchase_reply:
+                return DeterministicBusinessChatResult(
+                    handled=True,
+                    route="deterministic",
+                    intent=understanding.intent,
+                    entity_type=selected_entity.kind,
+                    entity_match_confidence=resolution.confidence,
+                    resolution_status="resolved",
+                    reply=supplier_product_purchase_reply,
+                )
         supplier_purchase_reply = _supplier_purchase_total_reply(
             conn,
             user_id=user_id,

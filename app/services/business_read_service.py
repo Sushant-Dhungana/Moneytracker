@@ -7,8 +7,8 @@ from typing import Literal
 from psycopg import Connection
 
 from app.core.errors import ApiError
-from app.services.ai_business_service import validate_business_profile_ownership
-from app.services.ai_business_vector_service import _first_existing_relation
+from app.arthaxai.tools.business_tools import validate_business_profile_ownership
+from app.arthaxai.services.ai_business_vector_service import _first_existing_relation
 
 TransactionSection = Literal["posting", "customer", "supplier"]
 
@@ -137,10 +137,11 @@ def _build_business_account_current_balance_sql(conn: Connection, *, active_only
 
 
 def _has_unified_business_categories(conn: Connection) -> bool:
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass('public.business_categories') as rel")
-        row = cur.fetchone() or {}
-    return bool(row.get("rel"))
+    return bool(_unified_business_categories_relation(conn))
+
+
+def _unified_business_categories_relation(conn: Connection) -> str | None:
+    return _first_existing_relation(conn, ["public.business_categories", "business.business_categories"])
 
 
 def _legacy_category_relation_for_domain(conn: Connection, domain: str) -> str | None:
@@ -856,12 +857,13 @@ def fetch_business_transactions_feed(
 
 
 def _fetch_business_product_categories(conn: Connection, *, user_id: str, profile_id: str) -> list[dict]:
-    if _has_unified_business_categories(conn):
+    unified_relation = _unified_business_categories_relation(conn)
+    if unified_relation:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 select id, user_id, profile_id, domain, name, parent_id, is_active, created_at, updated_at
-                from public.business_categories
+                from {unified_relation}
                 where user_id = %(user_id)s::uuid
                   and profile_id = %(profile_id)s::uuid
                   and domain = 'product'

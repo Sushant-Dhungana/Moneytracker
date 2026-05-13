@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from psycopg import Connection
@@ -11,6 +11,7 @@ from psycopg.pq import TransactionStatus
 
 from app.core.config import Settings
 from app.core.db import apply_db_auth_context
+from app.services.summary_service import compile_business_summary_payload
 
 _VECTOR_DOCS_RELATIONS = ["business.vector_documents", "business.ai_documents"]
 _VECTOR_JOBS_RELATIONS = ["business.vector_jobs", "business.ai_index_jobs"]
@@ -25,6 +26,7 @@ _PHASE1_SOURCE_KINDS = {
     "stock_product",
     "stock_summary",
     "invoice_outstanding",
+    "transaction_entry",
 }
 
 _SOURCE_KIND_ALIAS: dict[str, set[str]] = {
@@ -36,6 +38,7 @@ _SOURCE_KIND_ALIAS: dict[str, set[str]] = {
     "stock_product": {"stock_product", "inventory_low_stock"},
     "stock_summary": {"stock_summary", "inventory"},
     "invoice_outstanding": {"invoice_outstanding", "invoice_due"},
+    "transaction_entry": {"transaction_entry", "transaction", "entry"},
 }
 
 
@@ -271,6 +274,15 @@ def _doc_key(source_kind: str, source_id: str, chunk_index: int) -> tuple[str, s
     return (source_kind, source_id, chunk_index)
 
 
+def _parse_as_of(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
 
 def enqueue_business_ai_refresh_job(
     conn: Connection,
@@ -353,55 +365,40 @@ def _build_financial_overview_docs(
     *,
     user_id: str,
     profile_id: str,
-    postings_relation: str | None,
-    entries_relation: str | None,
     as_of: str,
 ) -> list[dict]:
-    if not postings_relation:
-        return []
+    all_summary = compile_business_summary_payload(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        period="all",
+        from_date=None,
+        to_date=None,
+        include_due_snapshot=True,
+        emit_diagnostics=False,
+        validate_profile=False,
+    )
+    month_summary = compile_business_summary_payload(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        period="month",
+        from_date=None,
+        to_date=None,
+        include_due_snapshot=False,
+        emit_diagnostics=False,
+        validate_profile=False,
+    )
 
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            select
-              coalesce(sum(case when leg_type in ('sales_revenue','income_bucket') and direction='credit' then amount else 0 end), 0) as total_income,
-              coalesce(sum(case when leg_type in ('cogs','expense_bucket') and direction='debit' then amount else 0 end), 0) as total_expense,
-              coalesce(sum(case when leg_type='receivable' and direction='debit' then amount when leg_type='receivable' and direction='credit' then -amount else 0 end), 0) as total_receivable_due,
-              coalesce(sum(case when leg_type='payable' and direction='credit' then amount when leg_type='payable' and direction='debit' then -amount else 0 end), 0) as total_payable_due
-            from {postings_relation}
-            where user_id = %(user_id)s::uuid
-              and profile_id = %(profile_id)s::uuid
-            """,
-            {"user_id": user_id, "profile_id": profile_id},
-        )
-        totals = cur.fetchone() or {}
-
-        month_income = 0.0
-        month_expense = 0.0
-        if entries_relation:
-            cur.execute(
-                f"""
-                select
-                  coalesce(sum(case when lp.leg_type in ('sales_revenue','income_bucket') and lp.direction='credit' then lp.amount else 0 end), 0) as month_income,
-                  coalesce(sum(case when lp.leg_type in ('cogs','expense_bucket') and lp.direction='debit' then lp.amount else 0 end), 0) as month_expense
-                from {postings_relation} lp
-                join {entries_relation} le on le.id = lp.entry_id
-                where lp.user_id = %(user_id)s::uuid
-                  and lp.profile_id = %(profile_id)s::uuid
-                  and le.date >= date_trunc('month', current_date)::date
-                  and le.date <= current_date
-                """,
-                {"user_id": user_id, "profile_id": profile_id},
-            )
-            month_row = cur.fetchone() or {}
-            month_income = float(month_row.get("month_income") or 0)
-            month_expense = float(month_row.get("month_expense") or 0)
-
-    total_income = float(totals.get("total_income") or 0)
-    total_expense = float(totals.get("total_expense") or 0)
-    total_receivable_due = float(totals.get("total_receivable_due") or 0)
-    total_payable_due = float(totals.get("total_payable_due") or 0)
-    net_total = total_income - total_expense
+    total_income = float(all_summary.get("income") or 0)
+    total_expense = float(all_summary.get("expense") or 0)
+    total_sales = float(all_summary.get("sales") or 0)
+    total_receivable_due = float(all_summary.get("receivable_due") or 0)
+    total_payable_due = float(all_summary.get("payable_due") or 0)
+    month_income = float(month_summary.get("income") or 0)
+    month_expense = float(month_summary.get("expense") or 0)
+    month_sales = float(month_summary.get("sales") or 0)
+    net_total = float(all_summary.get("net") or (total_income - total_expense))
 
     return [
         {
@@ -412,21 +409,25 @@ def _build_financial_overview_docs(
             "as_of": as_of,
             "content": (
                 "Business financial overview. "
+                f"Total sales NPR {total_sales:.2f}. "
                 f"Total income NPR {total_income:.2f}. "
                 f"Total expense NPR {total_expense:.2f}. "
                 f"Net NPR {net_total:.2f}. "
                 f"Receivable due NPR {total_receivable_due:.2f}. "
                 f"Payable due NPR {total_payable_due:.2f}. "
+                f"This month sales NPR {month_sales:.2f}. "
                 f"This month income NPR {month_income:.2f}. "
                 f"This month expense NPR {month_expense:.2f}."
             ),
             "metadata": {
                 "as_of": as_of,
+                "sales_total": total_sales,
                 "income_total": total_income,
                 "expense_total": total_expense,
                 "net_total": net_total,
                 "receivable_due_total": total_receivable_due,
                 "payable_due_total": total_payable_due,
+                "sales_this_month": month_sales,
                 "income_this_month": month_income,
                 "expense_this_month": month_expense,
                 "authoritative_numeric": False,
@@ -1123,6 +1124,197 @@ def _build_invoice_outstanding_docs(
     return docs
 
 
+def _build_transaction_docs(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    entries_relation: str | None,
+    postings_relation: str | None,
+    customers_relation: str | None,
+    suppliers_relation: str | None,
+    categories_relation: str | None,
+    as_of: str,
+    entry_id: str | None = None,
+) -> list[dict]:
+    if not entries_relation or not postings_relation:
+        return []
+
+    has_txn_type = _relation_has_column(conn, entries_relation, "txn_type")
+    has_description = _relation_has_column(conn, entries_relation, "description")
+    has_metadata = _relation_has_column(conn, entries_relation, "metadata")
+    has_category_id = _relation_has_column(conn, entries_relation, "category_id")
+    has_counterparty_id = _relation_has_column(conn, entries_relation, "counterparty_id")
+    has_account_id = _relation_has_column(conn, entries_relation, "account_id")
+    has_created_at = _relation_has_column(conn, entries_relation, "created_at")
+
+    join_customers = (
+        f"left join {customers_relation} c on c.id = le.counterparty_id and c.user_id = le.user_id and c.profile_id = le.profile_id"
+        if customers_relation and has_counterparty_id
+        else ""
+    )
+    join_suppliers = (
+        f"left join {suppliers_relation} s on s.id = le.counterparty_id and s.user_id = le.user_id and s.profile_id = le.profile_id"
+        if suppliers_relation and has_counterparty_id
+        else ""
+    )
+    join_categories = ""
+    if categories_relation and has_category_id:
+        cat_has_user = _relation_has_column(conn, categories_relation, "user_id")
+        cat_has_profile = _relation_has_column(conn, categories_relation, "profile_id")
+        if cat_has_user and cat_has_profile:
+            join_categories = (
+                f"left join {categories_relation} bc on bc.id = le.category_id and bc.user_id = le.user_id and bc.profile_id = le.profile_id"
+            )
+        elif cat_has_user:
+            join_categories = (
+                f"left join {categories_relation} bc on bc.id = le.category_id and bc.user_id = le.user_id"
+            )
+        else:
+            join_categories = f"left join {categories_relation} bc on bc.id = le.category_id"
+
+    customer_name_expr = "coalesce(c.name, '')" if join_customers else "''::text"
+    supplier_name_expr = "coalesce(s.name, '')" if join_suppliers else "''::text"
+    category_name_expr = "coalesce(bc.name, '')" if join_categories else "''::text"
+    txn_type_expr = "le.txn_type" if has_txn_type else "null::text as txn_type"
+    description_expr = "le.description" if has_description else "null::text as description"
+    metadata_expr = "le.metadata" if has_metadata else "null::jsonb as metadata"
+    category_id_expr = "le.category_id::text" if has_category_id else "null::text as category_id"
+    counterparty_id_expr = "le.counterparty_id::text" if has_counterparty_id else "null::text as counterparty_id"
+    account_id_expr = "le.account_id::text" if has_account_id else "null::text as account_id"
+
+    entry_id_filter = ""
+    bind_params: dict = {"user_id": user_id, "profile_id": profile_id}
+    normalized_entry_id = _sanitize_text(entry_id)
+    if normalized_entry_id:
+        entry_id_filter = "and le.id = %(entry_id)s::uuid"
+        bind_params["entry_id"] = normalized_entry_id
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              le.id::text as entry_id,
+              le.date::text as entry_date,
+              {txn_type_expr},
+              {description_expr},
+              {metadata_expr},
+              {category_id_expr},
+              {counterparty_id_expr},
+              {account_id_expr},
+              {customer_name_expr} as customer_name,
+              {supplier_name_expr} as supplier_name,
+              {category_name_expr} as category_name,
+              coalesce((
+                select sum(case when lp.leg_type in ('sales_revenue','income_bucket') and lp.direction='credit' then lp.amount else 0 end)
+                from {postings_relation} lp
+                where lp.user_id = le.user_id
+                  and lp.profile_id = le.profile_id
+                  and lp.entry_id = le.id
+              ), 0) as income_amount,
+              coalesce((
+                select sum(case when lp.leg_type in ('expense_bucket','cogs') and lp.direction='debit' then lp.amount else 0 end)
+                from {postings_relation} lp
+                where lp.user_id = le.user_id
+                  and lp.profile_id = le.profile_id
+                  and lp.entry_id = le.id
+              ), 0) as expense_amount
+            from {entries_relation} le
+            {join_customers}
+            {join_suppliers}
+            {join_categories}
+            where le.user_id = %(user_id)s::uuid
+              and le.profile_id = %(profile_id)s::uuid
+              {entry_id_filter}
+            order by le.date desc{", le.created_at desc" if has_created_at else ""}
+            """,
+            bind_params,
+        )
+        rows = cur.fetchall() or []
+
+    docs: list[dict] = []
+    for row in rows:
+        entry_id = _sanitize_text(row.get("entry_id"), "entry")
+        entry_date = _sanitize_text(row.get("entry_date"))
+        txn_type = _sanitize_text(row.get("txn_type"))
+        description = _sanitize_text(row.get("description"))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        income_amount = float(row.get("income_amount") or 0)
+        expense_amount = float(row.get("expense_amount") or 0)
+        if income_amount <= 0 and expense_amount <= 0:
+            continue
+
+        op = _sanitize_text(metadata.get("operation") if isinstance(metadata, dict) else "", "")
+        category_name = _sanitize_text(row.get("category_name"))
+        if not category_name and isinstance(metadata, dict):
+            category_name = _sanitize_text(metadata.get("category_name") or metadata.get("category"))
+
+        counterparty_name = _sanitize_text(row.get("customer_name")) or _sanitize_text(row.get("supplier_name"))
+        if not counterparty_name and isinstance(metadata, dict):
+            counterparty_name = _sanitize_text(
+                metadata.get("customer_name")
+                or metadata.get("supplier_name")
+                or metadata.get("counterparty_name")
+            )
+
+        resolved_type = txn_type or op
+        if not resolved_type:
+            if income_amount > 0 and expense_amount <= 0:
+                resolved_type = "income"
+            elif expense_amount > 0 and income_amount <= 0:
+                resolved_type = "expense"
+            else:
+                resolved_type = "transaction"
+
+        amount_value = income_amount if income_amount > 0 else expense_amount
+        amount_label = "Income" if income_amount > 0 else "Expense"
+        if resolved_type in {"sale", "sales"}:
+            amount_label = "Sale"
+        elif resolved_type in {"purchase", "stock_in", "stock-in"}:
+            amount_label = "Purchase"
+
+        content_parts = [
+            f"{amount_label} entry.",
+            f"Amount: NPR {amount_value:.2f}.",
+            f"Date: {entry_date}.",
+        ]
+        if category_name:
+            content_parts.append(f"Category: {category_name}.")
+        if counterparty_name:
+            content_parts.append(f"Counterparty: {counterparty_name}.")
+        if description:
+            content_parts.append(f"Notes: {description}.")
+
+        docs.append(
+            {
+                "source_kind": "transaction_entry",
+                "source_id": f"entry:{entry_id}",
+                "chunk_index": 0,
+                "schema_version": "v1",
+                "as_of": as_of,
+                "content": " ".join(content_parts),
+                "metadata": {
+                    "as_of": as_of,
+                    "entry_id": entry_id,
+                    "entry_date": entry_date or None,
+                    "txn_type": resolved_type or None,
+                    "amount": amount_value,
+                    "amount_label": amount_label,
+                    "income_amount": income_amount,
+                    "expense_amount": expense_amount,
+                    "category_id": _sanitize_text(row.get("category_id")) or None,
+                    "category_name": category_name or None,
+                    "counterparty_id": _sanitize_text(row.get("counterparty_id")) or None,
+                    "counterparty_name": counterparty_name or None,
+                    "account_id": _sanitize_text(row.get("account_id")) or None,
+                    "authoritative_numeric": False,
+                },
+            }
+        )
+
+    return docs
+
+
 
 def _collect_business_documents(
     conn: Connection,
@@ -1139,6 +1331,16 @@ def _collect_business_documents(
         conn, ["business.invoice_payments", "public.invoice_payments"]
     )
     products_relation = _first_existing_relation(conn, ["business.products", "public.products"])
+    categories_relation = _first_existing_relation(
+        conn,
+        [
+            "public.business_categories",
+            "business.business_categories",
+            "business.categories",
+            "public.categories",
+            "personal.categories",
+        ],
+    )
 
     as_of = _now_iso()
     docs: list[dict] = []
@@ -1148,8 +1350,6 @@ def _collect_business_documents(
             conn,
             user_id=user_id,
             profile_id=profile_id,
-            postings_relation=postings_relation,
-            entries_relation=entries_relation,
             as_of=as_of,
         )
     )
@@ -1222,6 +1422,20 @@ def _collect_business_documents(
         )
     )
 
+    docs.extend(
+        _build_transaction_docs(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            entries_relation=entries_relation,
+            postings_relation=postings_relation,
+            customers_relation=customers_relation,
+            suppliers_relation=suppliers_relation,
+            categories_relation=categories_relation,
+            as_of=as_of,
+        )
+    )
+
     return docs
 
 
@@ -1284,7 +1498,8 @@ def _upsert_business_documents_incremental(
               {"is_tombstone" if has_is_tombstone else "false"} as is_tombstone,
               content,
               metadata,
-              {"schema_version" if has_schema_version else "'v1'::text"} as schema_version
+              {"schema_version" if has_schema_version else "'v1'::text"} as schema_version,
+              {"as_of" if has_as_of else "null::timestamptz"} as as_of
             from {docs_relation}
             where user_id = %(user_id)s::uuid
               and profile_id = %(profile_id)s::uuid
@@ -1316,6 +1531,16 @@ def _upsert_business_documents_incremental(
                 existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {},
                 _sanitize_text(existing.get("schema_version"), "v1"),
             )
+
+        if has_as_of:
+            existing_as_of = _parse_as_of(_sanitize_text(existing.get("as_of")))
+            doc_as_of = _parse_as_of(_sanitize_text(doc.get("as_of")))
+            if existing_as_of and doc_as_of and existing_as_of > doc_as_of:
+                print(
+                    "[BusinessAI] Skipping stale vector doc update "
+                    f"{doc['source_kind']}:{doc['source_id']} (existing as_of {existing_as_of.isoformat()} > {doc_as_of.isoformat()})"
+                )
+                continue
 
         if existing_hash != doc["content_hash"] or bool(existing.get("is_tombstone")):
             changed_docs.append(doc)
@@ -1496,6 +1721,140 @@ def _run_full_profile_refresh(
     )
 
 
+def upsert_business_financial_overview_doc(
+    conn: Connection,
+    *,
+    settings: Settings,
+    user_id: str,
+    profile_id: str,
+) -> dict[str, int]:
+    postings_relation = _first_existing_relation(conn, ["business.ledger_postings", "public.ledger_postings"])
+    entries_relation = _first_existing_relation(conn, ["business.ledger_entries", "public.ledger_entries"])
+    as_of = _now_iso()
+    docs = _build_financial_overview_docs(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        as_of=as_of,
+    )
+    if not docs:
+        return {"total_docs": 0, "changed_docs": 0, "embedded_docs": 0, "tombstoned_docs": 0}
+    stats = _upsert_business_documents_incremental(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+        docs=docs,
+    )
+    print(f"[BusinessAI] Financial overview vectors updated (changed={stats.get('changed_docs', 0)})")
+    return stats
+
+
+def upsert_business_transaction_entry_doc(
+    conn: Connection,
+    *,
+    settings: Settings,
+    user_id: str,
+    profile_id: str,
+    entry_id: str,
+) -> dict[str, int]:
+    entries_relation = _first_existing_relation(conn, ["business.ledger_entries", "public.ledger_entries"])
+    postings_relation = _first_existing_relation(conn, ["business.ledger_postings", "public.ledger_postings"])
+    customers_relation = _first_existing_relation(conn, ["business.customers", "public.customers"])
+    suppliers_relation = _first_existing_relation(conn, ["business.suppliers", "public.suppliers"])
+    categories_relation = _first_existing_relation(
+        conn,
+        [
+            "public.business_categories",
+            "business.business_categories",
+            "business.categories",
+            "public.categories",
+            "personal.categories",
+        ],
+    )
+    as_of = _now_iso()
+    docs = _build_transaction_docs(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        entries_relation=entries_relation,
+        postings_relation=postings_relation,
+        customers_relation=customers_relation,
+        suppliers_relation=suppliers_relation,
+        categories_relation=categories_relation,
+        as_of=as_of,
+        entry_id=entry_id,
+    )
+    if not docs:
+        return {"total_docs": 0, "changed_docs": 0, "embedded_docs": 0, "tombstoned_docs": 0}
+    stats = _upsert_business_documents_incremental(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+        docs=docs,
+    )
+    print(
+        f"[BusinessAI] Transaction entry vectors updated for {entry_id} (changed={stats.get('changed_docs', 0)})"
+    )
+    return stats
+
+
+def tombstone_business_transaction_entry_doc(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    entry_id: str,
+) -> None:
+    docs_relation = _first_existing_relation(conn, _VECTOR_DOCS_RELATIONS)
+    if not docs_relation:
+        return
+    has_is_tombstone = _relation_has_column(conn, docs_relation, "is_tombstone")
+    has_deleted_at = _relation_has_column(conn, docs_relation, "deleted_at")
+    has_indexed_at = _relation_has_column(conn, docs_relation, "indexed_at")
+    source_id = f"entry:{_sanitize_text(entry_id, '')}"
+    if not source_id or source_id.endswith(":"):
+        return
+    if has_is_tombstone:
+        tombstone_set_parts = [
+            "is_tombstone = true",
+            "embedding = null",
+            "updated_at = now()",
+        ]
+        if has_deleted_at:
+            tombstone_set_parts.append("deleted_at = now()")
+        if has_indexed_at:
+            tombstone_set_parts.append("indexed_at = now()")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                update {docs_relation}
+                set {', '.join(tombstone_set_parts)}
+                where user_id = %(user_id)s::uuid
+                  and profile_id = %(profile_id)s::uuid
+                  and source_kind = 'transaction_entry'
+                  and source_id = %(source_id)s::text
+                  and chunk_index = 0
+                """,
+                {"user_id": user_id, "profile_id": profile_id, "source_id": source_id},
+            )
+    else:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                delete from {docs_relation}
+                where user_id = %(user_id)s::uuid
+                  and profile_id = %(profile_id)s::uuid
+                  and source_kind = 'transaction_entry'
+                  and source_id = %(source_id)s::text
+                  and chunk_index = 0
+                """,
+                {"user_id": user_id, "profile_id": profile_id, "source_id": source_id},
+            )
+    print(f"[BusinessAI] Transaction entry vectors tombstoned for {entry_id}")
+
+
 
 def process_pending_business_vector_jobs(
     conn: Connection,
@@ -1523,7 +1882,7 @@ def process_pending_business_vector_jobs(
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                select id, source_kind, source_id, attempts
+                select id, source_kind, source_id, attempts, created_at
                 from {jobs_relation}
                 where user_id = %(user_id)s::uuid
                   and profile_id = %(profile_id)s::uuid
@@ -1554,13 +1913,69 @@ def process_pending_business_vector_jobs(
     for job in jobs:
         job_id = int(job.get("id") or 0)
         attempts_after_running = int(job.get("attempts") or 0) + 1
+        job_source_kind = _sanitize_text(job.get("source_kind"), "full_refresh")
+        job_source_id = _sanitize_text(job.get("source_id"), "*")
+        job_created_at = job.get("created_at")
+        job_created_dt: datetime | None = None
+        if isinstance(job_created_at, datetime):
+            job_created_dt = job_created_at
+        elif isinstance(job_created_at, str):
+            job_created_dt = _parse_as_of(job_created_at)
         try:
-            stats = _run_full_profile_refresh(
-                conn,
-                settings=settings,
-                user_id=user_id,
-                profile_id=profile_id,
-            )
+            stats: dict[str, int]
+            docs_relation = _first_existing_relation(conn, _VECTOR_DOCS_RELATIONS)
+            has_as_of = bool(docs_relation and _relation_has_column(conn, docs_relation, "as_of"))
+            if job_source_kind == "financial_overview":
+                stats = upsert_business_financial_overview_doc(
+                    conn,
+                    settings=settings,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                )
+            elif job_source_kind == "transaction_entry" and job_source_id.startswith("entry:"):
+                entry_id = job_source_id.split("entry:", 1)[1].strip()
+                stats = upsert_business_transaction_entry_doc(
+                    conn,
+                    settings=settings,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    entry_id=entry_id,
+                )
+            else:
+                if has_as_of and job_created_dt and docs_relation:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            select max(as_of) as latest_as_of
+                            from {docs_relation}
+                            where user_id = %(user_id)s::uuid
+                              and profile_id = %(profile_id)s::uuid
+                              and source_kind = 'financial_overview'
+                            """,
+                            {"user_id": user_id, "profile_id": profile_id},
+                        )
+                        row = cur.fetchone() or {}
+                    latest_as_of = _parse_as_of(_sanitize_text(row.get("latest_as_of")))
+                    if latest_as_of and latest_as_of > job_created_dt:
+                        print(
+                            "[BusinessAI] Skipping stale vector refresh job "
+                            f"(job {job_id} created {job_created_dt.isoformat()} < latest {latest_as_of.isoformat()})"
+                        )
+                        stats = {"total_docs": 0, "changed_docs": 0, "embedded_docs": 0, "tombstoned_docs": 0}
+                    else:
+                        stats = _run_full_profile_refresh(
+                            conn,
+                            settings=settings,
+                            user_id=user_id,
+                            profile_id=profile_id,
+                        )
+                else:
+                    stats = _run_full_profile_refresh(
+                        conn,
+                        settings=settings,
+                        user_id=user_id,
+                        profile_id=profile_id,
+                    )
             with conn.transaction():
                 with conn.cursor() as cur:
                     if has_next_attempt_at:
@@ -1810,6 +2225,9 @@ def _infer_source_kinds_for_query(query: str) -> set[str]:
 
     if any(token in text for token in ["stock", "inventory", "product", "low stock", "qty", "quantity"]):
         selected.update({"stock_product", "stock_summary"})
+
+    if any(token in text for token in ["income", "expense", "sale", "sales", "purchase", "transaction", "category"]):
+        selected.update({"transaction_entry"})
 
     if any(token in text for token in ["overview", "summary", "income", "expense", "profit", "loss", "net"]):
         selected.update({"financial_overview"})
@@ -2144,6 +2562,11 @@ def retrieve_business_vector_matches(
     normalized_query = (query or "").strip()
     if not normalized_query:
         return []
+    normalized_lower = normalized_query.lower()
+    if "today" in normalized_lower:
+        normalized_query = f"{normalized_query} {date.today().isoformat()}"
+    elif "yesterday" in normalized_lower:
+        normalized_query = f"{normalized_query} {(date.today() - timedelta(days=1)).isoformat()}"
 
     safe_threshold = max(0.0, min(float(match_threshold), 1.0))
     safe_final_count = max(1, min(int(match_count), 20))
@@ -2202,8 +2625,10 @@ def collect_business_live_snapshot(
         "income_total": 0.0,
         "expense_total": 0.0,
         "net_total": 0.0,
+        "sales_total": 0.0,
         "income_this_month": 0.0,
         "expense_this_month": 0.0,
+        "sales_this_month": 0.0,
         "receivable_due_total": 0.0,
         "payable_due_total": 0.0,
         "outstanding_invoice_count": 0,
@@ -2218,13 +2643,41 @@ def collect_business_live_snapshot(
         "supplier_due_by_name": {},
     }
 
+    all_summary = compile_business_summary_payload(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        period="all",
+        from_date=None,
+        to_date=None,
+        include_due_snapshot=False,
+        emit_diagnostics=False,
+        validate_profile=False,
+    )
+    month_summary = compile_business_summary_payload(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        period="month",
+        from_date=None,
+        to_date=None,
+        include_due_snapshot=False,
+        emit_diagnostics=False,
+        validate_profile=False,
+    )
+    snapshot["sales_total"] = float(all_summary.get("sales") or 0)
+    snapshot["income_total"] = float(all_summary.get("income") or 0)
+    snapshot["expense_total"] = float(all_summary.get("expense") or 0)
+    snapshot["net_total"] = float(all_summary.get("net") or 0)
+    snapshot["sales_this_month"] = float(month_summary.get("sales") or 0)
+    snapshot["income_this_month"] = float(month_summary.get("income") or 0)
+    snapshot["expense_this_month"] = float(month_summary.get("expense") or 0)
+
     if postings_relation:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 select
-                  coalesce(sum(case when leg_type in ('sales_revenue','income_bucket') and direction='credit' then amount else 0 end), 0) as income_total,
-                  coalesce(sum(case when leg_type in ('cogs','expense_bucket') and direction='debit' then amount else 0 end), 0) as expense_total,
                   coalesce(sum(case when leg_type='receivable' and direction='debit' then amount when leg_type='receivable' and direction='credit' then -amount else 0 end), 0) as receivable_due_total,
                   coalesce(sum(case when leg_type='payable' and direction='credit' then amount when leg_type='payable' and direction='debit' then -amount else 0 end), 0) as payable_due_total
                 from {postings_relation}
@@ -2234,30 +2687,8 @@ def collect_business_live_snapshot(
                 {"user_id": user_id, "profile_id": profile_id},
             )
             totals = cur.fetchone() or {}
-            snapshot["income_total"] = float(totals.get("income_total") or 0)
-            snapshot["expense_total"] = float(totals.get("expense_total") or 0)
-            snapshot["net_total"] = float(snapshot["income_total"]) - float(snapshot["expense_total"])
             snapshot["receivable_due_total"] = float(totals.get("receivable_due_total") or 0)
             snapshot["payable_due_total"] = float(totals.get("payable_due_total") or 0)
-
-            if entries_relation:
-                cur.execute(
-                    f"""
-                    select
-                      coalesce(sum(case when lp.leg_type in ('sales_revenue','income_bucket') and lp.direction='credit' then lp.amount else 0 end), 0) as income_month,
-                      coalesce(sum(case when lp.leg_type in ('cogs','expense_bucket') and lp.direction='debit' then lp.amount else 0 end), 0) as expense_month
-                    from {postings_relation} lp
-                    join {entries_relation} le on le.id = lp.entry_id
-                    where lp.user_id = %(user_id)s::uuid
-                      and lp.profile_id = %(profile_id)s::uuid
-                      and le.date >= date_trunc('month', current_date)::date
-                      and le.date <= current_date
-                    """,
-                    {"user_id": user_id, "profile_id": profile_id},
-                )
-                month = cur.fetchone() or {}
-                snapshot["income_this_month"] = float(month.get("income_month") or 0)
-                snapshot["expense_this_month"] = float(month.get("expense_month") or 0)
 
     if invoices_relation:
         has_due_amount = _relation_has_column(conn, invoices_relation, "due_amount")

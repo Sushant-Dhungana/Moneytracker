@@ -26,6 +26,7 @@ def list_counterparties(conn: Connection, user_id: str, profile_id: str) -> list
       c.opening_balance,
       c.opening_date::text as opening_date,
       c.note,
+      c.opening_interest_settings,
       c.is_active,
       c.created_at::text as created_at,
       c.updated_at::text as updated_at
@@ -89,6 +90,7 @@ def get_counterparty_by_id(conn: Connection, *, user_id: str, counterparty_id: s
       c.opening_balance,
       c.opening_date::text as opening_date,
       c.note,
+      c.opening_interest_settings,
       c.is_active,
       c.created_at::text as created_at,
       c.updated_at::text as updated_at
@@ -117,4 +119,3 @@ def list_counterparty_positions(conn: Connection, *, user_id: str, profile_id: s
     with conn.cursor() as cur:
         cur.execute(query, (user_id, profile_id))
         return cur.fetchall() or []
-

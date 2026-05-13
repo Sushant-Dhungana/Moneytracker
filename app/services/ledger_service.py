@@ -21,6 +21,22 @@ from app.repositories.ledger_repository import (
     reverse_income_expense_entry,
     update_income_expense_entry,
 )
+from app.repositories.profile_repository import get_profile_summary
+from app.core.config import get_settings
+from app.arthaxai.services.ai_business_vector_service import (
+    upsert_business_financial_overview_doc,
+    upsert_business_transaction_entry_doc,
+    tombstone_business_transaction_entry_doc,
+)
+from app.arthaxai.services.ai_personal_vector_service import (
+    enqueue_personal_ai_refresh_job,
+    tombstone_personal_transaction_entry_doc,
+    upsert_personal_account_balance_docs,
+    upsert_personal_category_summary_docs,
+    upsert_personal_counterparty_position_docs,
+    upsert_personal_summary_doc,
+    upsert_personal_transaction_entry_doc,
+)
 from app.schemas.ledger import (
     IncomeExpenseCreateRequest,
     IncomeExpenseCreateResponse,
@@ -32,6 +48,138 @@ from app.schemas.ledger import (
     RepaymentOutCreateRequest,
     TransferCreateRequest,
 )
+
+def _commit_or_raise(
+    conn: Connection,
+    *,
+    code: str,
+    default_message: str,
+) -> None:
+    try:
+        conn.commit()
+    except PsycopgError as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ApiError(
+            status_code=400,
+            code=code,
+            message=str(exc).strip() or default_message,
+        ) from exc
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ApiError(
+            status_code=500,
+            code=code,
+            message=str(exc).strip() or default_message,
+        ) from exc
+
+
+def _commit_optional_side_effects(conn: Connection, *, label: str) -> None:
+    try:
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[BusinessAI] Commit failed after {label}: {exc}")
+
+
+def _refresh_ai_indexes_after_ledger_change(
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str,
+    active_profile_type: str | None,
+    entry_id: str | None = None,
+    tombstone_entry: bool = False,
+    label: str,
+) -> None:
+    normalized_profile_type = str(active_profile_type or "").strip().lower()
+    settings = get_settings()
+
+    if normalized_profile_type == "business":
+        upsert_business_financial_overview_doc(
+            conn,
+            settings=settings,
+            user_id=user_id,
+            profile_id=profile_id,
+        )
+        if entry_id:
+            if tombstone_entry:
+                tombstone_business_transaction_entry_doc(
+                    conn,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    entry_id=str(entry_id),
+                )
+            else:
+                upsert_business_transaction_entry_doc(
+                    conn,
+                    settings=settings,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    entry_id=str(entry_id),
+                )
+        _commit_optional_side_effects(conn, label=label)
+        return
+
+    if normalized_profile_type != "personal":
+        return
+
+    upsert_personal_summary_doc(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+    )
+    upsert_personal_category_summary_docs(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+    )
+    upsert_personal_account_balance_docs(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+    )
+    upsert_personal_counterparty_position_docs(
+        conn,
+        settings=settings,
+        user_id=user_id,
+        profile_id=profile_id,
+    )
+    if entry_id:
+        if tombstone_entry:
+            tombstone_personal_transaction_entry_doc(
+                conn,
+                user_id=user_id,
+                profile_id=profile_id,
+                entry_id=str(entry_id),
+            )
+        else:
+            upsert_personal_transaction_entry_doc(
+                conn,
+                settings=settings,
+                user_id=user_id,
+                profile_id=profile_id,
+                entry_id=str(entry_id),
+            )
+    enqueue_personal_ai_refresh_job(
+        conn,
+        user_id=user_id,
+        profile_id=profile_id,
+        source_kind="full_refresh",
+        source_id="*",
+    )
+    _commit_optional_side_effects(conn, label=label)
 
 
 def _validate_not_future(date_value: str) -> None:
@@ -48,6 +196,14 @@ def _validate_not_future(date_value: str) -> None:
         )
 
 
+def _resolve_idempotency_transaction_id(*candidates: str | None) -> str:
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return str(uuid4())
+
+
 def create_income_expense(
     conn: Connection, *, user_id: str, payload: IncomeExpenseCreateRequest
 ) -> IncomeExpenseCreateResponse:
@@ -59,6 +215,16 @@ def create_income_expense(
             status_code=400,
             code="missing_active_profile",
             message="No active profile found for this user.",
+        )
+    if __debug__:
+        print(
+            "[Perf] business.write.profile_resolved",
+            {
+                "user_id": user_id,
+                "profile_id": str(profile_id),
+                "entry_date": str(payload.date),
+                "txn_type": str(payload.type),
+            },
         )
 
     transaction_id = payload.transaction_id or str(uuid4())
@@ -111,6 +277,24 @@ def create_income_expense(
             code="ledger_write_unhandled",
             message=str(exc).strip() or "Unexpected error while creating transaction.",
         ) from exc
+    _commit_or_raise(
+        conn,
+        code="ledger_write_failed",
+        default_message="Failed to create ledger entry.",
+    )
+
+    try:
+        summary = get_profile_summary(conn, user_id)
+        _refresh_ai_indexes_after_ledger_change(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            active_profile_type=(summary or {}).get("active_profile_type"),
+            entry_id=entry_id,
+            label="income/expense create vector refresh",
+        )
+    except Exception as exc:
+        print(f"[AIIndex] Immediate vector refresh failed (income/expense create): {exc}")
 
     return IncomeExpenseCreateResponse(
         id=transaction_id,
@@ -176,6 +360,24 @@ def update_income_expense_by_transaction_id(
             code="ledger_update_unhandled",
             message=str(exc).strip() or "Unexpected error while updating transaction.",
         ) from exc
+    _commit_or_raise(
+        conn,
+        code="ledger_update_failed",
+        default_message="Failed to update transaction.",
+    )
+
+    try:
+        summary = get_profile_summary(conn, user_id)
+        _refresh_ai_indexes_after_ledger_change(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            active_profile_type=(summary or {}).get("active_profile_type"),
+            entry_id=str(entry_id) if entry_id else None,
+            label="income/expense update vector refresh",
+        )
+    except Exception as exc:
+        print(f"[AIIndex] Immediate vector refresh failed (income/expense update): {exc}")
 
     return IncomeExpenseCreateResponse(
         id=transaction_id,
@@ -234,6 +436,25 @@ def reverse_income_expense_by_transaction_id(
             code="ledger_delete_unhandled",
             message=str(exc).strip() or "Unexpected error while deleting transaction.",
         ) from exc
+    _commit_or_raise(
+        conn,
+        code="ledger_delete_failed",
+        default_message="Failed to delete transaction.",
+    )
+
+    try:
+        summary = get_profile_summary(conn, user_id)
+        _refresh_ai_indexes_after_ledger_change(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            active_profile_type=(summary or {}).get("active_profile_type"),
+            entry_id=str(entry_id) if entry_id else None,
+            tombstone_entry=True,
+            label="income/expense delete vector refresh",
+        )
+    except Exception as exc:
+        print(f"[AIIndex] Immediate vector refresh failed (income/expense delete): {exc}")
 
 
 def _create_ledger_entry_id_response(
@@ -279,6 +500,24 @@ def _create_ledger_entry_id_response(
             code="ledger_write_unhandled",
             message=str(exc).strip() or "Unexpected error while creating ledger entry.",
         ) from exc
+    _commit_or_raise(
+        conn,
+        code="ledger_write_failed",
+        default_message="Failed to create ledger entry.",
+    )
+
+    try:
+        summary = get_profile_summary(conn, user_id)
+        _refresh_ai_indexes_after_ledger_change(
+            conn,
+            user_id=user_id,
+            profile_id=profile_id,
+            active_profile_type=(summary or {}).get("active_profile_type"),
+            entry_id=str(entry_id) if entry_id else None,
+            label=f"{txn_type} vector refresh",
+        )
+    except Exception as exc:
+        print(f"[AIIndex] Immediate vector refresh failed ({txn_type}): {exc}")
 
     return LedgerEntryIdResponse(entry_id=entry_id)
 
@@ -287,13 +526,19 @@ def create_transfer(
     conn: Connection, *, user_id: str, payload: TransferCreateRequest
 ) -> LedgerEntryIdResponse:
     metadata = dict(payload.metadata or {})
-    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
+    resolved_transaction_id = _resolve_idempotency_transaction_id(
+        payload.transaction_id,
+        payload.idempotency_key,
+        metadata.get("transaction_id"),
+        metadata.get("idempotency_key"),
+    )
+    metadata["transaction_id"] = resolved_transaction_id
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
         txn_type="transfer",
-        transaction_id=metadata["transaction_id"],
+        transaction_id=resolved_transaction_id,
         create_fn=lambda profile_id: create_transfer_entry(
             conn,
             user_id=user_id,
@@ -313,13 +558,19 @@ def create_loan_out(
     conn: Connection, *, user_id: str, payload: LoanOutCreateRequest
 ) -> LedgerEntryIdResponse:
     metadata = dict(payload.metadata or {})
-    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
+    resolved_transaction_id = _resolve_idempotency_transaction_id(
+        payload.transaction_id,
+        payload.idempotency_key,
+        metadata.get("transaction_id"),
+        metadata.get("idempotency_key"),
+    )
+    metadata["transaction_id"] = resolved_transaction_id
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
         txn_type="loan_out",
-        transaction_id=metadata["transaction_id"],
+        transaction_id=resolved_transaction_id,
         create_fn=lambda profile_id: create_loan_out_entry(
             conn,
             user_id=user_id,
@@ -339,13 +590,19 @@ def create_loan_in(
     conn: Connection, *, user_id: str, payload: LoanInCreateRequest
 ) -> LedgerEntryIdResponse:
     metadata = dict(payload.metadata or {})
-    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
+    resolved_transaction_id = _resolve_idempotency_transaction_id(
+        payload.transaction_id,
+        payload.idempotency_key,
+        metadata.get("transaction_id"),
+        metadata.get("idempotency_key"),
+    )
+    metadata["transaction_id"] = resolved_transaction_id
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
         txn_type="loan_in",
-        transaction_id=metadata["transaction_id"],
+        transaction_id=resolved_transaction_id,
         create_fn=lambda profile_id: create_loan_in_entry(
             conn,
             user_id=user_id,
@@ -365,13 +622,19 @@ def create_repayment_in(
     conn: Connection, *, user_id: str, payload: RepaymentInCreateRequest
 ) -> LedgerEntryIdResponse:
     metadata = dict(payload.metadata or {})
-    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
+    resolved_transaction_id = _resolve_idempotency_transaction_id(
+        payload.transaction_id,
+        payload.idempotency_key,
+        metadata.get("transaction_id"),
+        metadata.get("idempotency_key"),
+    )
+    metadata["transaction_id"] = resolved_transaction_id
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
         txn_type="repayment_in",
-        transaction_id=metadata["transaction_id"],
+        transaction_id=resolved_transaction_id,
         create_fn=lambda profile_id: create_repayment_in_entry(
             conn,
             user_id=user_id,
@@ -391,13 +654,19 @@ def create_repayment_out(
     conn: Connection, *, user_id: str, payload: RepaymentOutCreateRequest
 ) -> LedgerEntryIdResponse:
     metadata = dict(payload.metadata or {})
-    metadata["transaction_id"] = payload.transaction_id or str(uuid4())
+    resolved_transaction_id = _resolve_idempotency_transaction_id(
+        payload.transaction_id,
+        payload.idempotency_key,
+        metadata.get("transaction_id"),
+        metadata.get("idempotency_key"),
+    )
+    metadata["transaction_id"] = resolved_transaction_id
     return _create_ledger_entry_id_response(
         conn,
         user_id=user_id,
         date_value=payload.date,
         txn_type="repayment_out",
-        transaction_id=metadata["transaction_id"],
+        transaction_id=resolved_transaction_id,
         create_fn=lambda profile_id: create_repayment_out_entry(
             conn,
             user_id=user_id,

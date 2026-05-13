@@ -1,7 +1,9 @@
 from collections.abc import Generator
 from contextlib import contextmanager
+import time
 
 from psycopg import Connection
+from psycopg import Error as PsycopgError
 from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -10,6 +12,30 @@ from app.core.config import get_settings
 from app.core.errors import ApiError
 
 _pool: ConnectionPool | None = None
+
+
+def _translate_db_error(exc: PsycopgError) -> ApiError:
+    message = str(exc).strip()
+    sqlstate = getattr(exc, "sqlstate", None)
+    concise_message = message.split("\n")[0].strip() if message else "Database operation failed."
+
+    if (
+        sqlstate == "P0001"
+        or "Insufficient bank balance" in concise_message
+        or "Insufficient cash balance" in concise_message
+        or "Available minimum is" in concise_message
+    ):
+        return ApiError(
+            status_code=400,
+            code="db_rule_violation",
+            message=concise_message,
+        )
+
+    return ApiError(
+        status_code=500,
+        code="db_operation_failed",
+        message="Database operation failed.",
+    )
 
 
 def _recover_pool_connections() -> None:
@@ -61,6 +87,17 @@ def get_db_conn() -> Generator[Connection, None, None]:
     if _pool is None:
         raise ApiError(status_code=500, code="db_init_failed", message="Database pool is not initialized.")
 
+    # Retry once for transient dropped pooled connections (common on idle wakeups).
+    try:
+        with _pool.connection() as conn:
+            yield conn
+            return
+    except PsycopgOperationalError:
+        _recover_pool_connections()
+        time.sleep(0.05)
+    except PsycopgError as exc:
+        raise _translate_db_error(exc) from exc
+
     try:
         with _pool.connection() as conn:
             yield conn
@@ -74,6 +111,8 @@ def get_db_conn() -> Generator[Connection, None, None]:
                 "recovering a dropped connection; retry shortly."
             ),
         ) from exc
+    except PsycopgError as exc:
+        raise _translate_db_error(exc) from exc
 
 
 @contextmanager

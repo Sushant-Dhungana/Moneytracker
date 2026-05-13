@@ -2,8 +2,8 @@ from psycopg import Connection
 
 from app.repositories.profile_repository import get_profile_summary
 from app.services.accounts_service import fetch_accounts
-from app.services.ai_business_service import validate_business_profile_ownership
-from app.services.ai_business_vector_service import collect_business_live_snapshot
+from app.arthaxai.tools.business_tools import validate_business_profile_ownership
+from app.arthaxai.services.ai_business_vector_service import collect_business_live_snapshot
 from app.services.profiles_service import fetch_active_profile_state
 
 
@@ -43,15 +43,26 @@ def fetch_mobile_bootstrap(conn: Connection, *, user_id: str, email: str | None)
     active_profile_id = state.get("activeProfileId")
     active_profile_type = str(state.get("activeProfileType") or "personal")
     currency_code = str(profile_summary.get("currency_code") or "NPR").upper()
-    is_personal_profile_complete = bool(profile_summary.get("profile_completed"))
+    personal_profile_id = next(
+        (
+            str(profile.get("id") or "").strip()
+            for profile in (state.get("profiles") or [])
+            if str(profile.get("profile_type") or "").strip() == "personal"
+        ),
+        "",
+    )
 
     has_cash_account = False
-    if active_profile_id and active_profile_type == "personal":
+    if personal_profile_id:
         try:
-            accounts = fetch_accounts(conn, user_id, active_profile_id)
+            accounts = fetch_accounts(conn, user_id, personal_profile_id)
         except Exception:
             accounts = []
         has_cash_account = any(str(item.get("type") or "") == "cash" for item in accounts)
+
+    is_personal_profile_complete = bool(profile_summary.get("profile_completed")) or bool(
+        has_cash_account
+    )
 
     if active_profile_id and active_profile_type == "business":
         validate_business_profile_ownership(

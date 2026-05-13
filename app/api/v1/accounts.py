@@ -21,6 +21,7 @@ class AccountCreateRequest(BaseModel):
     type: str = Field(pattern="^(cash|bank)$")
     opening_balance: float = 0
     opening_date: str
+    qr_image_url: str | None = None
     profile_id: str | None = None
 
 
@@ -32,6 +33,7 @@ class BankAccountSettingsRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     allow_overdraft: bool = False
     overdraft_limit: float = 0
+    qr_image_url: str | None = None
 
 
 @router.get("/balances", response_model=AccountBalancesResponse)
@@ -72,6 +74,7 @@ def post_account(
         account_type=payload.type,
         opening_balance=payload.opening_balance,
         opening_date=payload.opening_date,
+        qr_image_url=payload.qr_image_url,
     )
     return {"item": item}
 
@@ -103,5 +106,6 @@ def patch_bank_settings(
         name=payload.name,
         allow_overdraft=payload.allow_overdraft,
         overdraft_limit=payload.overdraft_limit,
+        qr_image_url=payload.qr_image_url,
     )
     return {"item": item}

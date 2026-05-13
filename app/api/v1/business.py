@@ -13,6 +13,7 @@ from psycopg import Error as PsycopgError
 from psycopg.errors import (
     CheckViolation,
     DeadlockDetected,
+    ForeignKeyViolation,
     LockNotAvailable,
     QueryCanceled,
     UndefinedColumn,
@@ -22,8 +23,10 @@ from psycopg.errors import (
 )
 from psycopg.types.json import Jsonb
 from psycopg import Connection
+from psycopg.pq import TransactionStatus
 
 from app.core.auth import AuthContext, get_auth_context
+from app.core.config import get_settings
 from app.core.db import apply_db_auth_context, get_db_conn
 from app.core.errors import ApiError
 from app.schemas.business import (
@@ -56,7 +59,11 @@ from app.services.business_read_service import (
     fetch_business_transactions_feed,
     search_business_customers,
 )
-from app.services.ai_business_vector_service import enqueue_business_ai_refresh_job
+from app.arthaxai.services.ai_business_vector_service import (
+    enqueue_business_ai_refresh_job,
+    upsert_business_financial_overview_doc,
+    upsert_business_transaction_entry_doc,
+)
 
 router = APIRouter(prefix="/business", tags=["business"])
 _BUSINESS_CATEGORY_DOMAINS = {"product", "customer", "supplier", "income", "expense"}
@@ -148,6 +155,15 @@ _PRODUCT_DUPLICATE_NAME_CONSTRAINTS = {
 _PRODUCT_DUPLICATE_SKU_CONSTRAINTS = {
     "uq_business_products_profile_sku_active",
 }
+
+
+def _normalize_optional_uuid(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        return None
 
 _RPC_JSONB_PARAMS = {
     # Sales line items payload is JSONB in SQL function signature.
@@ -480,6 +496,7 @@ def post_business_stock_in_batch(
         conn,
         user_id=auth.user_id,
         profile_id=payload.profile_id,
+        entry_ids=entry_ids,
     )
 
     response = BusinessStockInBatchResponse(
@@ -664,6 +681,7 @@ def post_business_sale(
         conn,
         user_id=auth.user_id,
         profile_id=payload.profile_id,
+        entry_ids=[entry_id] if entry_id else None,
     )
     ai_refresh_ms = (perf_counter() - ai_refresh_started_at) * 1000
     receipt_started_at = perf_counter()
@@ -757,7 +775,13 @@ def _create_sales_invoice_entry_direct(
     inventory_movements_relation = _business_inventory_movements_relation(conn)
     units_relation = _first_existing_relation(conn, ["business.units", "public.units"])
     categories_relation = _first_existing_relation(
-        conn, ["public.business_categories", "business.product_categories", "public.product_categories"]
+        conn,
+        [
+            "public.business_categories",
+            "business.business_categories",
+            "business.product_categories",
+            "public.product_categories",
+        ],
     )
 
     if (
@@ -2719,12 +2743,39 @@ def _create_business_opening_stock_entry_direct(
 
 
 def _enqueue_business_ai_refresh(
-    conn: Connection, *, user_id: str, profile_id: str | None
+    conn: Connection,
+    *,
+    user_id: str,
+    profile_id: str | None,
+    entry_ids: list[str] | None = None,
 ) -> None:
     normalized_profile_id = str(profile_id or "").strip()
     if not normalized_profile_id:
         return
     try:
+        try:
+            settings = get_settings()
+            upsert_business_financial_overview_doc(
+                conn,
+                settings=settings,
+                user_id=user_id,
+                profile_id=normalized_profile_id,
+            )
+            for entry_id in entry_ids or []:
+                normalized_entry_id = str(entry_id or "").strip()
+                if not normalized_entry_id:
+                    continue
+                upsert_business_transaction_entry_doc(
+                    conn,
+                    settings=settings,
+                    user_id=user_id,
+                    profile_id=normalized_profile_id,
+                    entry_id=normalized_entry_id,
+                )
+        except Exception as exc:
+            _reset_failed_transaction(conn)
+            print(f"[BusinessAI] Immediate vector refresh failed: {exc}")
+
         enqueue_business_ai_refresh_job(
             conn,
             user_id=user_id,
@@ -2733,7 +2784,16 @@ def _enqueue_business_ai_refresh(
             source_id="*",
         )
     except Exception as exc:  # pragma: no cover - background side-effect
+        _reset_failed_transaction(conn)
         print(f"[BusinessAI] Failed to enqueue index refresh job: {exc}")
+
+
+def _reset_failed_transaction(conn: Connection) -> None:
+    try:
+        if conn.info.transaction_status == TransactionStatus.INERROR:
+            conn.rollback()
+    except Exception:
+        pass
 
 def _to_json_safe(value: object) -> object:
     if value is None:
@@ -3464,10 +3524,100 @@ def _list_business_category_candidates(
 
 
 def _has_unified_business_categories(conn: Connection) -> bool:
+    return bool(_unified_business_categories_relation(conn))
+
+
+def _unified_business_categories_relation(conn: Connection) -> str | None:
+    return _first_existing_relation(conn, ["public.business_categories", "business.business_categories"])
+
+
+def _raise_product_category_hierarchy_unavailable() -> None:
+    raise ApiError(
+        status_code=409,
+        code="product_category_hierarchy_unavailable",
+        message=(
+            "Product category hierarchy is unavailable on the current database schema. "
+            "Run the latest category hierarchy migrations and try again."
+        ),
+    )
+
+
+def _legacy_product_category_uses_flat_name_uniqueness(
+    conn: Connection,
+    relation: str,
+) -> bool:
     with conn.cursor() as cur:
-        cur.execute("select to_regclass('public.business_categories') as rel")
-        row = cur.fetchone() or {}
-    return bool(row.get("rel"))
+        cur.execute(
+            """
+            select 1
+            from pg_constraint con
+            join pg_class rel on rel.oid = con.conrelid
+            join pg_namespace nsp on nsp.oid = rel.relnamespace
+            where con.contype = 'u'
+              and nsp.nspname || '.' || rel.relname = %(relation)s
+              and con.conname in (
+                'product_categories_profile_id_name_key',
+                'business_product_categories_profile_id_name_key'
+              )
+            limit 1
+            """,
+            {"relation": relation},
+        )
+        if cur.fetchone():
+            return True
+
+        cur.execute(
+            """
+            select 1
+            from pg_indexes
+            where schemaname || '.' || tablename = %(relation)s
+              and (
+                indexname in (
+                  'uq_product_categories_profile_name',
+                  'uq_business_product_categories_profile_name'
+                )
+                or indexdef ilike '%%(profile_id, name)%%'
+              )
+            limit 1
+            """,
+            {"relation": relation},
+        )
+        if cur.fetchone():
+            return True
+
+        cur.execute(
+            """
+            select 1
+            from pg_indexes
+            where schemaname || '.' || tablename = %(relation)s
+              and indexname in (
+                'uq_business_product_categories_profile_parent_name',
+                'uq_public_product_categories_profile_parent_name'
+              )
+            limit 1
+            """,
+            {"relation": relation},
+        )
+        return not bool(cur.fetchone())
+
+
+def _is_legacy_product_category_flat_unique_violation(exc: PsycopgError) -> bool:
+    constraint_name = str(getattr(getattr(exc, "diag", None), "constraint_name", "") or "").strip()
+    if constraint_name in {
+        "product_categories_profile_id_name_key",
+        "business_product_categories_profile_id_name_key",
+        "uq_product_categories_profile_name",
+        "uq_business_product_categories_profile_name",
+    }:
+        return True
+
+    message = str(exc).lower()
+    return (
+        "product_categories_profile_id_name_key" in message
+        or "business_product_categories_profile_id_name_key" in message
+        or "uq_product_categories_profile_name" in message
+        or "uq_business_product_categories_profile_name" in message
+    )
 
 
 def _first_existing_relation(conn: Connection, candidates: list[str]) -> str | None:
@@ -3610,6 +3760,55 @@ def _business_invoice_payments_relation(conn: Connection) -> str | None:
 
 def _business_invoice_documents_relation(conn: Connection) -> str | None:
     return _first_existing_relation(conn, ["business.invoice_documents", "public.invoice_documents"])
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + str(identifier or "").replace('"', '""') + '"'
+
+
+def _invoice_documents_upsert_conflict_clause(conn: Connection, relation: str) -> str | None:
+    if "." not in relation:
+        return None
+    schema_name, table_name = relation.split(".", 1)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select
+              con.conname as constraint_name,
+              array_agg(att.attname order by key_col.ord) as columns
+            from pg_constraint con
+            join pg_class rel on rel.oid = con.conrelid
+            join pg_namespace nsp on nsp.oid = rel.relnamespace
+            join unnest(con.conkey) with ordinality as key_col(attnum, ord) on true
+            join pg_attribute att on att.attrelid = rel.oid and att.attnum = key_col.attnum
+            where con.contype = 'u'
+              and nsp.nspname = %(schema_name)s
+              and rel.relname = %(table_name)s
+            group by con.conname
+            """,
+            {"schema_name": schema_name, "table_name": table_name},
+        )
+        rows = cur.fetchall() or []
+
+    preferred: str | None = None
+    fallback: str | None = None
+    for row in rows:
+        constraint_name = str(row.get("constraint_name") or "").strip()
+        columns = [str(col or "").strip() for col in (row.get("columns") or []) if str(col or "").strip()]
+        if not constraint_name or not columns:
+            continue
+        if "invoice_id" not in columns:
+            continue
+        if "template_version" in columns:
+            preferred = constraint_name
+            break
+        if fallback is None:
+            fallback = constraint_name
+
+    chosen = preferred or fallback
+    if not chosen:
+        return None
+    return f"on conflict on constraint {_quote_ident(chosen)}"
 
 
 def _business_products_relation(conn: Connection) -> str | None:
@@ -4101,6 +4300,288 @@ def _collect_customer_receivable_direct(
     return entry_id
 
 
+def _repay_business_payable_direct(
+    conn: Connection,
+    *,
+    auth_user_id: str,
+    profile_id: str,
+    supplier_id: str | None,
+    supplier_name: str | None,
+    amount: float,
+    account_id: str,
+    entry_date: date | None,
+    note: str | None,
+) -> str:
+    suppliers_relation = _business_suppliers_relation(conn)
+    ledger_entries_relation = _business_ledger_entries_relation(conn)
+    ledger_postings_relation = _business_ledger_postings_relation(conn)
+    if not suppliers_relation or not ledger_entries_relation or not ledger_postings_relation:
+        raise ApiError(
+            status_code=500,
+            code="business_ledger_tables_missing",
+            message="Business ledger/supplier tables are not available.",
+        )
+
+    if amount <= 0:
+        raise ApiError(
+            status_code=400,
+            code="invalid_amount",
+            message="Repayment amount must be greater than zero.",
+        )
+
+    if entry_date is not None and entry_date > date.today():
+        raise ApiError(
+            status_code=400,
+            code="invalid_date",
+            message="Future dates are not allowed.",
+        )
+
+    normalized_supplier_id = str(supplier_id or "").strip()
+    normalized_supplier_name = str(supplier_name or "").strip()
+    if not normalized_supplier_id and not normalized_supplier_name:
+        raise ApiError(
+            status_code=400,
+            code="invalid_supplier",
+            message="Supplier is required for payable repayment.",
+        )
+
+    has_assert_active_profile = _function_exists(
+        conn,
+        "public.assert_active_business_profile(uuid,uuid)",
+    )
+    has_assert_profile_owner = _function_exists(
+        conn,
+        "public.assert_profile_ownership(uuid,uuid)",
+    )
+    has_counterparty_col = _relation_has_column(conn, ledger_entries_relation, "counterparty_id")
+    has_metadata_col = _relation_has_column(conn, ledger_entries_relation, "metadata")
+
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if has_assert_active_profile:
+                    cur.execute(
+                        "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
+                        {"user_id": auth_user_id, "profile_id": profile_id},
+                    )
+                elif has_assert_profile_owner:
+                    cur.execute(
+                        "select public.assert_profile_ownership(%(user_id)s::uuid, %(profile_id)s::uuid)",
+                        {"user_id": auth_user_id, "profile_id": profile_id},
+                    )
+
+                cur.execute(
+                    """
+                    select 1
+                    from public.accounts a
+                    where a.id = %(account_id)s::uuid
+                      and a.user_id = %(user_id)s::uuid
+                      and a.profile_id = %(profile_id)s::uuid
+                      and a.is_active = true
+                      and a.type in ('cash', 'bank', 'merchant')
+                    limit 1
+                    """,
+                    {
+                        "account_id": account_id,
+                        "user_id": auth_user_id,
+                        "profile_id": profile_id,
+                    },
+                )
+                if not cur.fetchone():
+                    raise ApiError(
+                        status_code=400,
+                        code="invalid_account",
+                        message="Invalid account for this profile.",
+                    )
+
+                supplier_where = []
+                supplier_params: dict[str, object] = {
+                    "user_id": auth_user_id,
+                    "profile_id": profile_id,
+                }
+                if normalized_supplier_id:
+                    supplier_where.append("s.id = %(supplier_id)s::uuid")
+                    supplier_params["supplier_id"] = normalized_supplier_id
+                if normalized_supplier_name:
+                    supplier_where.append("lower(coalesce(s.name, '')) = lower(%(supplier_name)s)")
+                    supplier_params["supplier_name"] = normalized_supplier_name
+                supplier_predicate = " or ".join(supplier_where)
+                cur.execute(
+                    f"""
+                    select s.id::text as id, s.name
+                    from {suppliers_relation} s
+                    where s.user_id = %(user_id)s::uuid
+                      and s.profile_id = %(profile_id)s::uuid
+                      and ({supplier_predicate})
+                    limit 1
+                    """,
+                    supplier_params,
+                )
+                supplier_row = cur.fetchone() or {}
+                resolved_supplier_id = str(supplier_row.get("id") or "").strip()
+                resolved_supplier_name = str(supplier_row.get("name") or "").strip()
+                if not resolved_supplier_id or not resolved_supplier_name:
+                    raise ApiError(
+                        status_code=404,
+                        code="supplier_not_found",
+                        message="Supplier not found for this profile.",
+                    )
+
+                metadata_supplier_match_sql = "false"
+                if has_metadata_col:
+                    metadata_supplier_match_sql = """
+                      coalesce(le.metadata ->> 'supplier_id', '') = %(supplier_id_text)s
+                      or lower(coalesce(le.metadata ->> 'supplier_name', '')) = lower(%(supplier_name)s)
+                      or lower(coalesce(le.metadata ->> 'party_name', '')) = lower(%(supplier_name)s)
+                    """
+
+                cur.execute(
+                    f"""
+                    select coalesce(
+                      sum(
+                        case
+                          when lp.direction = 'credit' then lp.amount
+                          when lp.direction = 'debit' then -lp.amount
+                          else 0
+                        end
+                      ),
+                      0
+                    ) as due_amount
+                    from {ledger_postings_relation} lp
+                    join {ledger_entries_relation} le
+                      on le.id = lp.entry_id
+                     and le.user_id = lp.user_id
+                     and le.profile_id = lp.profile_id
+                    where lp.user_id = %(user_id)s::uuid
+                      and lp.profile_id = %(profile_id)s::uuid
+                      and lp.leg_type = 'payable'
+                      and (
+                        lp.ref_id = %(supplier_id)s::uuid
+                        or (
+                          lp.ref_id is null
+                          and (
+                            {metadata_supplier_match_sql}
+                            or lower(coalesce(le.description, '')) like lower('%%supplier: ' || %(supplier_name)s || '%%')
+                            or lower(coalesce(le.description, '')) like lower('%%party: ' || %(supplier_name)s || '%%')
+                          )
+                        )
+                      )
+                    """,
+                    {
+                        "user_id": auth_user_id,
+                        "profile_id": profile_id,
+                        "supplier_id": resolved_supplier_id,
+                        "supplier_id_text": resolved_supplier_id,
+                        "supplier_name": resolved_supplier_name,
+                    },
+                )
+                due_row = cur.fetchone() or {}
+                due_amount = max(0.0, round(float(due_row.get("due_amount") or 0), 2))
+                if due_amount <= 0:
+                    raise ApiError(
+                        status_code=400,
+                        code="no_supplier_due",
+                        message="No pending payable due for this supplier.",
+                    )
+
+                amount_rounded = round(float(amount), 2)
+                if amount_rounded > due_amount:
+                    raise ApiError(
+                        status_code=400,
+                        code="supplier_due_exceeded",
+                        message="Repayment exceeds pending supplier payable amount.",
+                    )
+
+                description = f"Payable repayment | Supplier: {resolved_supplier_name}"
+                if note and note.strip():
+                    description += f" | Note: {note.strip()}"
+
+                entry_columns = [
+                    "user_id",
+                    "profile_id",
+                    "txn_type",
+                    "amount",
+                    "date",
+                    "description",
+                    "account_id",
+                ]
+                entry_values = [
+                    "%(user_id)s::uuid",
+                    "%(profile_id)s::uuid",
+                    "'adjustment'",
+                    "%(amount)s::numeric",
+                    "%(entry_date)s::date",
+                    "%(description)s",
+                    "%(account_id)s::uuid",
+                ]
+                entry_bind: dict[str, object] = {
+                    "user_id": auth_user_id,
+                    "profile_id": profile_id,
+                    "amount": amount_rounded,
+                    "entry_date": (entry_date or date.today()).isoformat(),
+                    "description": description,
+                    "account_id": account_id,
+                }
+                if has_metadata_col:
+                    entry_columns.append("metadata")
+                    entry_values.append("%(metadata)s::jsonb")
+                    entry_bind["metadata"] = Jsonb(
+                        {
+                            "operation": "payable_repayment",
+                            "source": "business_transactions",
+                            "supplier_id": resolved_supplier_id,
+                            "supplier_name": resolved_supplier_name,
+                            "account_id": account_id,
+                        }
+                    )
+
+                cur.execute(
+                    f"""
+                    insert into {ledger_entries_relation} ({", ".join(entry_columns)})
+                    values ({", ".join(entry_values)})
+                    returning id::text as entry_id
+                    """,
+                    entry_bind,
+                )
+                entry_row = cur.fetchone() or {}
+                entry_id = str(entry_row.get("entry_id") or "").strip()
+                if not entry_id:
+                    raise ApiError(
+                        status_code=500,
+                        code="payable_repayment_insert_failed",
+                        message="Failed to create payable repayment ledger entry.",
+                    )
+
+                cur.execute(
+                    f"""
+                    insert into {ledger_postings_relation} (
+                      entry_id, user_id, profile_id, leg_type, ref_id, direction, amount
+                    )
+                    values
+                      (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'account', %(account_id)s::uuid, 'credit', %(amount)s::numeric),
+                      (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'payable', %(supplier_id)s::uuid, 'debit', %(amount)s::numeric)
+                    """,
+                    {
+                        "entry_id": entry_id,
+                        "user_id": auth_user_id,
+                        "profile_id": profile_id,
+                        "account_id": account_id,
+                        "supplier_id": resolved_supplier_id,
+                        "amount": amount_rounded,
+                    },
+                )
+
+                _assert_business_ledger_entry_is_balanced(
+                    conn,
+                    ledger_postings_relation=ledger_postings_relation,
+                    entry_id=entry_id,
+                )
+    except PsycopgError as exc:
+        raise _translate_rpc_db_error("repay_business_payable", exc) from exc
+
+    return entry_id
+
+
 def _list_business_suppliers_direct(
     conn: Connection,
     *,
@@ -4287,6 +4768,8 @@ def _create_business_supplier_direct(
     reminder_date: str | None,
 ) -> dict:
     relation = _business_suppliers_relation(conn)
+    ledger_entries_relation = _business_ledger_entries_relation(conn)
+    ledger_postings_relation = _business_ledger_postings_relation(conn)
     if not relation:
         raise ApiError(
             status_code=500,
@@ -4443,6 +4926,103 @@ def _create_business_supplier_direct(
             created = cur.fetchone() or {}
             created_id = str(created.get("id") or "").strip()
             if created_id:
+                if (
+                    opening_balance > 0
+                    and ledger_entries_relation
+                    and ledger_postings_relation
+                ):
+                    has_ledger_metadata_col = _relation_has_column(
+                        conn, ledger_entries_relation, "metadata"
+                    )
+                    entry_columns = [
+                        "user_id",
+                        "profile_id",
+                        "txn_type",
+                        "amount",
+                        "date",
+                        "description",
+                    ]
+                    entry_values = [
+                        "%(user_id)s::uuid",
+                        "%(profile_id)s::uuid",
+                        "'opening_supplier'",
+                        "%(amount)s::numeric",
+                        "current_date",
+                        "%(description)s",
+                    ]
+                    entry_bind: dict[str, object] = {
+                        "user_id": auth_user_id,
+                        "profile_id": profile_id,
+                        "amount": opening_balance,
+                        "description": (
+                            f"Opening supplier balance | Supplier: {normalized_name} | "
+                            f"Type: {str(opening_balance_type or 'credit').strip().title()}"
+                        ),
+                    }
+                    if has_ledger_metadata_col:
+                        entry_columns.append("metadata")
+                        entry_values.append("%(metadata)s::jsonb")
+                        entry_bind["metadata"] = Jsonb(
+                            {
+                                "source": "supplier_opening",
+                                "supplier_id": created_id,
+                                "supplier_name": normalized_name,
+                                "opening_balance_type": opening_balance_type,
+                            }
+                        )
+
+                    cur.execute(
+                        f"""
+                        insert into {ledger_entries_relation} ({", ".join(entry_columns)})
+                        values ({", ".join(entry_values)})
+                        returning id::text as entry_id
+                        """,
+                        entry_bind,
+                    )
+                    entry_row = cur.fetchone() or {}
+                    entry_id = str(entry_row.get("entry_id") or "").strip()
+                    if entry_id:
+                        if str(opening_balance_type or "credit").strip().lower() == "advance":
+                            cur.execute(
+                                f"""
+                                insert into {ledger_postings_relation} (
+                                  entry_id, user_id, profile_id, leg_type, ref_id, direction, amount
+                                )
+                                values
+                                  (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'payable', %(supplier_id)s::uuid, 'debit', %(amount)s::numeric),
+                                  (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'opening_equity', null, 'credit', %(amount)s::numeric)
+                                """,
+                                {
+                                    "entry_id": entry_id,
+                                    "user_id": auth_user_id,
+                                    "profile_id": profile_id,
+                                    "supplier_id": created_id,
+                                    "amount": opening_balance,
+                                },
+                            )
+                        else:
+                            cur.execute(
+                                f"""
+                                insert into {ledger_postings_relation} (
+                                  entry_id, user_id, profile_id, leg_type, ref_id, direction, amount
+                                )
+                                values
+                                  (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'opening_equity', null, 'debit', %(amount)s::numeric),
+                                  (%(entry_id)s::uuid, %(user_id)s::uuid, %(profile_id)s::uuid, 'payable', %(supplier_id)s::uuid, 'credit', %(amount)s::numeric)
+                                """,
+                                {
+                                    "entry_id": entry_id,
+                                    "user_id": auth_user_id,
+                                    "profile_id": profile_id,
+                                    "supplier_id": created_id,
+                                    "amount": opening_balance,
+                                },
+                            )
+                        _assert_business_ledger_entry_is_balanced(
+                            conn,
+                            ledger_postings_relation=ledger_postings_relation,
+                            entry_id=entry_id,
+                        )
                 loaded = _load_business_supplier_item(
                     conn,
                     auth_user_id=auth_user_id,
@@ -4481,9 +5061,9 @@ def _create_business_supplier_direct(
 
 
 def _force_legacy_category_domain(domain: str) -> bool:
-    # Product CRUD must stay on product category tables because product RPCs/foreign keys
-    # reference those tables directly.
-    return domain == "product"
+    # Product categories can use unified business_categories when available.
+    # Product validation and reads already support unified category ids.
+    return False
 
 
 @router.post("/rpc", response_model=BusinessRpcResponse)
@@ -4725,6 +5305,76 @@ def post_business_rpc(
         )
         return BusinessRpcResponse(data=_to_json_safe(fallback_entry_id))
 
+    if payload.name == "repay_business_payable":
+        profile_id = str(params.get("p_profile_id") or "").strip()
+        supplier_id = str(params.get("p_supplier_id") or "").strip() or None
+        supplier_name = str(params.get("p_party_name") or "").strip() or None
+        account_id = str(params.get("p_account_id") or "").strip()
+        raw_amount = params.get("p_amount")
+        raw_date = params.get("p_date")
+        note = params.get("p_note")
+
+        if not profile_id:
+            raise ApiError(
+                status_code=400,
+                code="invalid_rpc_param",
+                message="Missing required RPC parameter: p_profile_id",
+            )
+        if not account_id:
+            raise ApiError(
+                status_code=400,
+                code="invalid_rpc_param",
+                message="Missing required RPC parameter: p_account_id",
+            )
+        if not supplier_id and not supplier_name:
+            raise ApiError(
+                status_code=400,
+                code="invalid_rpc_param",
+                message="Missing required RPC parameter: p_supplier_id or p_party_name",
+            )
+        try:
+            amount_value = float(raw_amount)
+        except (TypeError, ValueError):
+            raise ApiError(
+                status_code=400,
+                code="invalid_rpc_param",
+                message="Missing or invalid RPC parameter: p_amount",
+            )
+
+        entry_date_value: date | None = None
+        if raw_date is not None and str(raw_date).strip():
+            entry_date_value = _parse_iso_date_or_raise(str(raw_date))
+
+        try:
+            data = _execute_named_rpc(conn, payload.name, params)
+            _enqueue_business_ai_refresh(
+                conn,
+                user_id=auth.user_id,
+                profile_id=profile_id,
+            )
+            return BusinessRpcResponse(data=_to_json_safe(data))
+        except ApiError as exc:
+            if exc.code != "business_rpc_missing":
+                raise
+
+        fallback_entry_id = _repay_business_payable_direct(
+            conn,
+            auth_user_id=auth.user_id,
+            profile_id=profile_id,
+            supplier_id=supplier_id,
+            supplier_name=supplier_name,
+            amount=amount_value,
+            account_id=account_id,
+            entry_date=entry_date_value,
+            note=note.strip() if isinstance(note, str) else None,
+        )
+        _enqueue_business_ai_refresh(
+            conn,
+            user_id=auth.user_id,
+            profile_id=profile_id,
+        )
+        return BusinessRpcResponse(data=_to_json_safe(fallback_entry_id))
+
     data = _execute_named_rpc(conn, payload.name, params)
     if payload.name in _BUSINESS_AI_WRITE_RPC_NAMES:
         _enqueue_business_ai_refresh(
@@ -4743,6 +5393,11 @@ def get_business_accounts(
     conn: Connection = Depends(get_db_conn),
 ) -> BusinessAccountsResponse:
     apply_db_auth_context(conn, auth.user_id)
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth.user_id,
+        profile_id=profile_id,
+    )
     accounts_relation = _business_accounts_relation(conn)
     if not accounts_relation:
         raise ApiError(
@@ -4865,11 +5520,24 @@ def get_business_pos_bootstrap(
     conn: Connection = Depends(get_db_conn),
 ) -> BusinessPosBootstrapResponse:
     apply_db_auth_context(conn, auth.user_id)
-    payload = fetch_business_pos_bootstrap(
-        conn,
-        user_id=auth.user_id,
-        profile_id=profile_id,
-    )
+    try:
+        _assert_active_business_profile_or_raise(
+            conn,
+            auth_user_id=auth.user_id,
+            profile_id=profile_id,
+        )
+        payload = fetch_business_pos_bootstrap(
+            conn,
+            user_id=auth.user_id,
+            profile_id=profile_id,
+        )
+    except PsycopgError as exc:
+        if (
+            "assert_active_business_profile" in str(exc)
+            or "Business profile is not active" in str(exc)
+        ):
+            raise _translate_business_profile_assertion_error(exc) from exc
+        raise
     return BusinessPosBootstrapResponse(**payload)
 
 
@@ -5279,6 +5947,14 @@ def deactivate_business_account(
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
     apply_db_auth_context(conn, auth.user_id)
+    try:
+        UUID(str(account_id).strip())
+    except (TypeError, ValueError):
+        raise ApiError(
+            status_code=400,
+            code="invalid_business_account_id",
+            message="Business account id is invalid.",
+        )
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -5345,6 +6021,9 @@ def get_business_ledger_postings_by_entry(
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
     apply_db_auth_context(conn, auth.user_id)
+    normalized_entry_id = _normalize_optional_uuid(entry_id)
+    if not normalized_entry_id:
+        return {"items": []}
     ledger_postings_relations = _existing_relations(
         conn,
         ["business.ledger_postings", "public.ledger_postings"],
@@ -5374,7 +6053,7 @@ def get_business_ledger_postings_by_entry(
             {
                 "user_id": auth.user_id,
                 "profile_id": profile_id,
-                "entry_id": entry_id,
+                "entry_id": normalized_entry_id,
             },
         )
         items = cur.fetchall() or []
@@ -5465,7 +6144,7 @@ def get_business_reference_maps(
         if suppliers_relation:
             cur.execute(
                 f"""
-                select id, name
+                select id, name, opening_balance, opening_balance_type
                 from {suppliers_relation}
                 where user_id = %(user_id)s
                   and profile_id = %(profile_id)s
@@ -5781,12 +6460,15 @@ def list_business_categories(
             )
             return {"items": cur.fetchall() or []}
 
+    unified_relation = _unified_business_categories_relation(conn)
+    if not unified_relation:
+        return {"items": []}
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             select
               id, user_id, profile_id, domain, name, parent_id, is_active, created_at, updated_at
-            from public.business_categories
+            from {unified_relation}
             where user_id = %(user_id)s
               and profile_id = %(profile_id)s
               and domain = %(domain)s
@@ -5811,7 +6493,7 @@ def create_business_category(
 ) -> dict:
     profile_id = str(payload.get("profile_id") or "").strip()
     name = _normalize_business_category_display_name(str(payload.get("name") or ""))
-    parent_id = str(payload.get("parent_id") or "").strip() or None
+    raw_parent_id = str(payload.get("parent_id") or "").strip() or None
     domain = _validate_business_category_domain(str(payload.get("domain") or ""))
 
     if not profile_id:
@@ -5819,7 +6501,27 @@ def create_business_category(
     if not name:
         raise ApiError(status_code=400, code="name_required", message="name is required.")
 
+    parent_id = _normalize_optional_uuid(raw_parent_id)
+    if raw_parent_id and not parent_id:
+        normalized_raw_parent = str(raw_parent_id).strip().lower()
+        if normalized_raw_parent.startswith("optimistic:") or normalized_raw_parent.startswith("local-category-"):
+            raise ApiError(
+                status_code=409,
+                code="parent_category_sync_pending",
+                message="Parent category is still syncing. Please wait a moment and try again.",
+            )
+        raise ApiError(
+            status_code=400,
+            code="invalid_parent_id",
+            message="parent_id is invalid.",
+        )
+
     apply_db_auth_context(conn, auth.user_id)
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth.user_id,
+        profile_id=profile_id,
+    )
 
     if _force_legacy_category_domain(domain) or not _has_unified_business_categories(conn):
         relation = _legacy_category_relation_for_domain(conn, domain)
@@ -5834,6 +6536,15 @@ def create_business_category(
         has_type = _relation_has_column(conn, relation, "type")
         has_is_active = _relation_has_column(conn, relation, "is_active")
         has_updated_at = _relation_has_column(conn, relation, "updated_at")
+        if (
+            domain == "product"
+            and parent_id
+            and (
+                not has_parent_id
+                or _legacy_product_category_uses_flat_name_uniqueness(conn, relation)
+            )
+        ):
+            _raise_product_category_hierarchy_unavailable()
         existing_items = _list_business_category_candidates(
             conn,
             auth=auth,
@@ -5865,33 +6576,42 @@ def create_business_category(
         if has_parent_id:
             columns.append("parent_id")
             values.append("%(parent_id)s::uuid")
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                insert into {relation} ({", ".join(columns)})
-                values ({", ".join(values)})
-                returning
-                  id,
-                  user_id,
-                  {'profile_id' if has_profile_id else '%(profile_id)s::uuid as profile_id'},
-                  {'type::text' if has_type else '%(domain)s::text'} as domain,
-                  name,
-                  {'parent_id' if has_parent_id else 'null::uuid'} as parent_id,
-                  {'is_active' if has_is_active else 'true'} as is_active,
-                  created_at,
-                  {'updated_at' if has_updated_at else 'created_at'} as updated_at
-                """,
-                {
-                    "user_id": auth.user_id,
-                    "profile_id": profile_id,
-                    "name": name,
-                    "domain": domain,
-                    "parent_id": parent_id,
-                },
-            )
-            item = cur.fetchone()
-            _enqueue_business_ai_refresh(conn, user_id=auth.user_id, profile_id=profile_id)
-            return {"item": item}
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    insert into {relation} ({", ".join(columns)})
+                    values ({", ".join(values)})
+                    returning
+                      id,
+                      user_id,
+                      {'profile_id' if has_profile_id else '%(profile_id)s::uuid as profile_id'},
+                      {'type::text' if has_type else '%(domain)s::text'} as domain,
+                      name,
+                      {'parent_id' if has_parent_id else 'null::uuid'} as parent_id,
+                      {'is_active' if has_is_active else 'true'} as is_active,
+                      created_at,
+                      {'updated_at' if has_updated_at else 'created_at'} as updated_at
+                    """,
+                    {
+                        "user_id": auth.user_id,
+                        "profile_id": profile_id,
+                        "name": name,
+                        "domain": domain,
+                        "parent_id": parent_id,
+                    },
+                )
+                item = cur.fetchone()
+                _enqueue_business_ai_refresh(conn, user_id=auth.user_id, profile_id=profile_id)
+                return {"item": item}
+        except UniqueViolation as exc:
+            if domain == "product" and parent_id and _is_legacy_product_category_flat_unique_violation(exc):
+                _raise_product_category_hierarchy_unavailable()
+            raise
+        except PsycopgError as exc:
+            if "assert_active_business_profile" in str(exc) or "Business profile is not active" in str(exc):
+                raise _translate_business_profile_assertion_error(exc) from exc
+            raise
 
     existing_items = _list_business_category_candidates(
         conn,
@@ -5908,27 +6628,40 @@ def create_business_category(
             "resolution": f"matched_{resolution}",
         }
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into public.business_categories (
-              user_id, profile_id, domain, name, parent_id
-            )
-            values (
-              %(user_id)s::uuid, %(profile_id)s::uuid, %(domain)s::text, %(name)s::text, %(parent_id)s::uuid
-            )
-            returning
-              id, user_id, profile_id, domain, name, parent_id, is_active, created_at, updated_at
-            """,
-            {
-                "user_id": auth.user_id,
-                "profile_id": profile_id,
-                "domain": domain,
-                "name": name,
-                "parent_id": parent_id,
-            },
+    unified_relation = _unified_business_categories_relation(conn)
+    if not unified_relation:
+        raise ApiError(
+            status_code=400,
+            code="category_domain_not_available",
+            message=f"{domain.capitalize()} category table is not available. Run latest migrations.",
         )
-        item = cur.fetchone()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into {unified_relation} (
+                  user_id, profile_id, domain, name, parent_id
+                )
+                values (
+                  %(user_id)s::uuid, %(profile_id)s::uuid, %(domain)s::text, %(name)s::text, %(parent_id)s::uuid
+                )
+                returning
+                  id, user_id, profile_id, domain, name, parent_id, is_active, created_at, updated_at
+                """,
+                {
+                    "user_id": auth.user_id,
+                    "profile_id": profile_id,
+                    "domain": domain,
+                    "name": name,
+                    "parent_id": parent_id,
+                },
+            )
+            item = cur.fetchone()
+    except PsycopgError as exc:
+        if "assert_active_business_profile" in str(exc) or "Business profile is not active" in str(exc):
+            raise _translate_business_profile_assertion_error(exc) from exc
+        raise
     _enqueue_business_ai_refresh(conn, user_id=auth.user_id, profile_id=profile_id)
     return {"item": item}
 
@@ -5960,6 +6693,15 @@ def update_business_category(
         has_type = _relation_has_column(conn, relation, "type")
         has_is_active = _relation_has_column(conn, relation, "is_active")
         has_updated_at = _relation_has_column(conn, relation, "updated_at")
+        if (
+            legacy_domain == "product"
+            and parent_id
+            and (
+                not has_parent_id
+                or _legacy_product_category_uses_flat_name_uniqueness(conn, relation)
+            )
+        ):
+            _raise_product_category_hierarchy_unavailable()
         current_where_parts = [
             "id = %(category_id)s::uuid",
             "user_id = %(user_id)s::uuid",
@@ -6031,33 +6773,38 @@ def update_business_category(
         if has_updated_at:
             set_parts.append("updated_at = now()")
         set_sql = ", ".join(set_parts)
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                update {relation}
-                   set {set_sql}
-                 where {where_sql}
-                returning
-                  id,
-                  user_id,
-                  {'profile_id' if has_profile_id else '%(profile_id)s::uuid as profile_id'},
-                  {'type::text' if has_type else '%(domain)s::text'} as domain,
-                  name,
-                  {'parent_id' if has_parent_id else 'null::uuid'} as parent_id,
-                  {'is_active' if has_is_active else 'true'} as is_active,
-                  created_at,
-                  {'updated_at' if has_updated_at else 'created_at'} as updated_at
-                """,
-                {
-                    "category_id": category_id,
-                    "user_id": auth.user_id,
-                    "profile_id": profile_id,
-                    "name": name,
-                    "parent_id": parent_id,
-                    "domain": legacy_domain,
-                },
-            )
-            item = cur.fetchone()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    update {relation}
+                       set {set_sql}
+                     where {where_sql}
+                    returning
+                      id,
+                      user_id,
+                      {'profile_id' if has_profile_id else '%(profile_id)s::uuid as profile_id'},
+                      {'type::text' if has_type else '%(domain)s::text'} as domain,
+                      name,
+                      {'parent_id' if has_parent_id else 'null::uuid'} as parent_id,
+                      {'is_active' if has_is_active else 'true'} as is_active,
+                      created_at,
+                      {'updated_at' if has_updated_at else 'created_at'} as updated_at
+                    """,
+                    {
+                        "category_id": category_id,
+                        "user_id": auth.user_id,
+                        "profile_id": profile_id,
+                        "name": name,
+                        "parent_id": parent_id,
+                        "domain": legacy_domain,
+                    },
+                )
+                item = cur.fetchone()
+        except UniqueViolation as exc:
+            if legacy_domain == "product" and parent_id and _is_legacy_product_category_flat_unique_violation(exc):
+                _raise_product_category_hierarchy_unavailable()
+            raise
         if item:
             _enqueue_business_ai_refresh(conn, user_id=auth.user_id, profile_id=profile_id)
             return {"item": item}
@@ -6069,11 +6816,19 @@ def update_business_category(
             message="Business category not found.",
         )
 
+    unified_relation = _unified_business_categories_relation(conn)
+    if not unified_relation:
+        raise ApiError(
+            status_code=404,
+            code="category_not_found",
+            message="Business category not found.",
+        )
+
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             select id, user_id, profile_id, domain, name, parent_id, is_active, created_at, updated_at
-            from public.business_categories
+            from {unified_relation}
             where id = %(category_id)s::uuid
               and user_id = %(user_id)s::uuid
               and profile_id = %(profile_id)s::uuid
@@ -6119,8 +6874,8 @@ def update_business_category(
 
     with conn.cursor() as cur:
         cur.execute(
-            """
-            update public.business_categories
+            f"""
+            update {unified_relation}
                set name = %(name)s::text,
                    parent_id = %(parent_id)s::uuid,
                    updated_at = now()
@@ -6158,6 +6913,21 @@ def deactivate_business_category(
     auth: AuthContext = Depends(get_auth_context),
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
+    normalized_category_id = _normalize_optional_uuid(category_id)
+    if not normalized_category_id:
+        normalized_raw = str(category_id or "").strip()
+        # Local-first optimistic/local categories are not persisted on backend yet.
+        # Treat delete as idempotent success to avoid UUID cast failures.
+        if normalized_raw.startswith("optimistic:business-category:") or normalized_raw.startswith(
+            "local-category-"
+        ):
+            return {"ok": True}
+        raise ApiError(
+            status_code=400,
+            code="invalid_category_id",
+            message="Invalid category id.",
+        )
+
     apply_db_auth_context(conn, auth.user_id)
 
     for legacy_domain in ("product", "customer", "supplier", "income", "expense"):
@@ -6188,7 +6958,7 @@ def deactivate_business_category(
                     returning id
                     """,
                     {
-                        "category_id": category_id,
+                        "category_id": normalized_category_id,
                         "user_id": auth.user_id,
                         "profile_id": profile_id,
                         "domain": legacy_domain,
@@ -6202,7 +6972,7 @@ def deactivate_business_category(
                     returning id
                     """,
                     {
-                        "category_id": category_id,
+                        "category_id": normalized_category_id,
                         "user_id": auth.user_id,
                         "profile_id": profile_id,
                         "domain": legacy_domain,
@@ -6220,11 +6990,19 @@ def deactivate_business_category(
             message="Business category not found.",
         )
 
+    unified_relation = _unified_business_categories_relation(conn)
+    if not unified_relation:
+        raise ApiError(
+            status_code=404,
+            code="category_not_found",
+            message="Business category not found.",
+        )
+
     with conn.cursor() as cur:
         # First, move all child categories to top level (parent_id = NULL)
         cur.execute(
-            """
-            update public.business_categories
+            f"""
+            update {unified_relation}
                set parent_id = null,
                    updated_at = now()
              where user_id = %(user_id)s::uuid
@@ -6235,14 +7013,14 @@ def deactivate_business_category(
             {
                 "user_id": auth.user_id,
                 "profile_id": profile_id,
-                "category_id": category_id,
+                "category_id": normalized_category_id,
             },
         )
 
         # Then, soft delete the parent category
         cur.execute(
-            """
-            update public.business_categories
+            f"""
+            update {unified_relation}
                set is_active = false,
                    updated_at = now()
              where id = %(category_id)s::uuid
@@ -6252,7 +7030,7 @@ def deactivate_business_category(
             returning id
             """,
             {
-                "category_id": category_id,
+                "category_id": normalized_category_id,
                 "user_id": auth.user_id,
                 "profile_id": profile_id,
             },
@@ -6719,6 +7497,13 @@ def deactivate_business_customer(
     auth: AuthContext = Depends(get_auth_context),
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
+    normalized_customer_id = _normalize_optional_uuid(customer_id)
+    if not normalized_customer_id:
+        raise ApiError(
+            status_code=400,
+            code="invalid_customer_id",
+            message="customer_id is invalid.",
+        )
     apply_db_auth_context(conn, auth.user_id)
     relation = _business_customers_relation(conn)
     if not relation:
@@ -6734,7 +7519,7 @@ def deactivate_business_customer(
                and profile_id = %(profile_id)s
             returning id
             """,
-            {"customer_id": customer_id, "user_id": auth.user_id, "profile_id": profile_id},
+            {"customer_id": normalized_customer_id, "user_id": auth.user_id, "profile_id": profile_id},
         )
         row = cur.fetchone()
     if not row:
@@ -7138,7 +7923,6 @@ def list_business_inventory_movements(
             from {relation}
             where user_id = %(user_id)s
               and profile_id = %(profile_id)s
-              and ref_type <> 'opening'
             order by date desc, created_at desc
             limit %(limit)s
             """,
@@ -7461,12 +8245,20 @@ def _create_business_product_direct(
 
     normalized_name = str(name or "").strip()
     normalized_unit_id = str(unit_id or "").strip()
-    normalized_category_id = str(category_id or "").strip() or None
+    normalized_category_id = _normalize_optional_uuid(category_id)
     normalized_sku = str(sku or "").strip() or None
     if not normalized_name:
         raise ApiError(status_code=400, code="name_required", message="name is required.")
     if not normalized_unit_id:
         raise ApiError(status_code=400, code="unit_required", message="unit_id is required.")
+    try:
+        normalized_unit_id = str(UUID(normalized_unit_id))
+    except (TypeError, ValueError):
+        raise ApiError(
+            status_code=400,
+            code="invalid_unit",
+            message="Selected unit is invalid for this profile.",
+        )
 
     rounded_price = round(max(0.0, float(price or 0)), 2)
     rounded_selling_price = round(max(0.0, float(selling_price or 0)), 2)
@@ -7552,11 +8344,18 @@ def _create_business_product_direct(
                 category_valid = bool(cur.fetchone())
 
         if not category_valid and _has_unified_business_categories(conn):
+            unified_relation = _unified_business_categories_relation(conn)
+            if not unified_relation:
+                raise ApiError(
+                    status_code=400,
+                    code="invalid_category",
+                    message="Selected category is invalid for this profile.",
+                )
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     select id::text as id
-                    from public.business_categories
+                    from {unified_relation}
                     where id = %(category_id)s::uuid
                       and user_id = %(user_id)s::uuid
                       and profile_id = %(profile_id)s::uuid
@@ -7579,18 +8378,21 @@ def _create_business_product_direct(
                 message="Selected category is invalid for this profile.",
             )
 
-    if has_assert_active_profile:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
-                {"user_id": auth_user_id, "profile_id": profile_id},
-            )
-    elif has_assert_profile_owner:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select public.assert_profile_ownership(%(user_id)s::uuid, %(profile_id)s::uuid)",
-                {"user_id": auth_user_id, "profile_id": profile_id},
-            )
+    try:
+        if has_assert_active_profile:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select public.assert_active_business_profile(%(user_id)s::uuid, %(profile_id)s::uuid)",
+                    {"user_id": auth_user_id, "profile_id": profile_id},
+                )
+        elif has_assert_profile_owner:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select public.assert_profile_ownership(%(user_id)s::uuid, %(profile_id)s::uuid)",
+                    {"user_id": auth_user_id, "profile_id": profile_id},
+                )
+    except PsycopgError as exc:
+        raise _translate_business_profile_assertion_error(exc) from exc
 
     try:
         # Savepoint scope keeps the parent transaction usable when insert hits a unique conflict.
@@ -7735,6 +8537,14 @@ def create_business_product_endpoint(
             message="Opening unit cost must be greater than zero when opening inventory is set.",
         )
 
+    safe_category_id = _normalize_optional_uuid(payload.category_id)
+
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth.user_id,
+        profile_id=payload.profile_id,
+    )
+
     create_step_ms = 0.0
     opening_step_ms = 0.0
     load_step_ms = 0.0
@@ -7756,7 +8566,7 @@ def create_business_product_endpoint(
                     "p_selling_price": payload.selling_price,
                     "p_quantity": payload.quantity,
                     "p_unit_id": payload.unit_id,
-                    "p_category_id": payload.category_id,
+                    "p_category_id": safe_category_id,
                     "p_sku": payload.sku,
                 },
             )
@@ -7771,7 +8581,7 @@ def create_business_product_endpoint(
                 profile_id=payload.profile_id,
                 name=payload.name.strip(),
                 unit_id=payload.unit_id,
-                category_id=payload.category_id,
+                category_id=safe_category_id,
                 sku=payload.sku,
                 price=payload.price,
                 selling_price=payload.selling_price,
@@ -7784,12 +8594,12 @@ def create_business_product_endpoint(
                 _find_business_product_id_by_identity(
                     conn,
                     auth_user_id=auth.user_id,
-                    profile_id=payload.profile_id,
-                    name=payload.name.strip(),
-                    unit_id=payload.unit_id,
-                    category_id=payload.category_id,
-                    sku=payload.sku,
-                )
+                profile_id=payload.profile_id,
+                name=payload.name.strip(),
+                unit_id=payload.unit_id,
+                category_id=safe_category_id,
+                sku=payload.sku,
+            )
                 or ""
             )
 
@@ -7917,6 +8727,11 @@ def list_business_products_feed(
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
     apply_db_auth_context(conn, auth.user_id)
+    _assert_active_business_profile_or_raise(
+        conn,
+        auth_user_id=auth.user_id,
+        profile_id=profile_id,
+    )
 
     bind: dict[str, object] = {
         "profile_id": profile_id,
@@ -7991,6 +8806,82 @@ def list_business_products_feed(
         "next_offset": next_offset,
         "category_counts": category_counts,
     }
+
+
+@router.delete("/products/{product_id}")
+def deactivate_business_product(
+    product_id: UUID,
+    profile_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+    conn: Connection = Depends(get_db_conn),
+) -> dict:
+    apply_db_auth_context(conn, auth.user_id)
+    relation = _business_products_relation(conn)
+    if not relation:
+        raise ApiError(
+            status_code=500,
+            code="business_products_table_missing",
+            message="Business products table is not available.",
+        )
+
+    has_profile_id = _relation_has_column(conn, relation, "profile_id")
+    where_parts = [
+        "id = %(product_id)s::uuid",
+        "user_id = %(user_id)s::uuid",
+    ]
+    if has_profile_id:
+        where_parts.append("profile_id = %(profile_id)s::uuid")
+    where_sql = " and ".join(where_parts)
+    bind = {
+        "product_id": str(product_id),
+        "user_id": auth.user_id,
+        "profile_id": profile_id,
+    }
+
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("set local lock_timeout = '3000ms'")
+                cur.execute("set local statement_timeout = '15000ms'")
+                cur.execute(
+                    f"""
+                    delete from {relation}
+                     where {where_sql}
+                    returning id::text as id
+                    """,
+                    bind,
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise ApiError(
+                        status_code=404,
+                        code="product_not_found",
+                        message="Business product not found.",
+                    )
+    except ForeignKeyViolation as exc:
+        raise ApiError(
+            status_code=409,
+            code="product_delete_referenced",
+            message="This product is used in existing invoices or ledger records and cannot be permanently deleted.",
+        ) from exc
+    except PsycopgError as exc:
+        raise ApiError(
+            status_code=400,
+            code="product_delete_failed",
+            message=str(exc).strip() or "Failed to delete product.",
+        ) from exc
+
+    _reset_failed_transaction(conn)
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute("set local lock_timeout = '1000ms'")
+                cur.execute("set local statement_timeout = '3000ms'")
+                _enqueue_business_ai_refresh(conn, user_id=auth.user_id, profile_id=profile_id)
+    except Exception as exc:  # pragma: no cover - best effort side effect
+        _reset_failed_transaction(conn)
+        print(f"[Business] Product delete AI refresh enqueue skipped: {exc}")
+    return {"ok": True, "product_id": str(product_id)}
 
 
 @router.patch("/products/{product_id}/selling-price")
@@ -8230,6 +9121,13 @@ def get_business_invoice_detail(
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
     apply_db_auth_context(conn, auth.user_id)
+    normalized_invoice_id = _normalize_optional_uuid(invoice_id)
+    if not normalized_invoice_id:
+        raise ApiError(
+            status_code=400,
+            code="invalid_invoice_id",
+            message="Invoice id must be a valid UUID.",
+        )
     invoices_relation = _business_invoices_relation(conn)
     if not invoices_relation:
         raise ApiError(status_code=500, code="invoices_table_missing", message="Invoice table is not available.")
@@ -8248,7 +9146,7 @@ def get_business_invoice_detail(
             where i.id = %(invoice_id)s and i.user_id = %(user_id)s
             limit 1
             """,
-            {"invoice_id": invoice_id, "user_id": auth.user_id},
+            {"invoice_id": normalized_invoice_id, "user_id": auth.user_id},
         )
         invoice = cur.fetchone()
         if not invoice:
@@ -8262,7 +9160,7 @@ def get_business_invoice_detail(
                 where invoice_id = %(invoice_id)s and user_id = %(user_id)s
                 order by created_at asc
                 """,
-                {"invoice_id": invoice_id, "user_id": auth.user_id},
+                {"invoice_id": normalized_invoice_id, "user_id": auth.user_id},
             )
             items = cur.fetchall() or []
         else:
@@ -8276,7 +9174,7 @@ def get_business_invoice_detail(
                 where invoice_id = %(invoice_id)s and user_id = %(user_id)s
                 order by date desc, created_at desc
                 """,
-                {"invoice_id": invoice_id, "user_id": auth.user_id},
+                {"invoice_id": normalized_invoice_id, "user_id": auth.user_id},
             )
             payments = cur.fetchall() or []
         else:
@@ -8291,7 +9189,7 @@ def get_business_invoice_detail(
                 order by created_at desc
                 limit 1
                 """,
-                {"invoice_id": invoice_id, "user_id": auth.user_id},
+                {"invoice_id": normalized_invoice_id, "user_id": auth.user_id},
             )
             document = cur.fetchone()
         else:
@@ -8410,42 +9308,110 @@ def upsert_business_invoice_document(
     auth: AuthContext = Depends(get_auth_context),
     conn: Connection = Depends(get_db_conn),
 ) -> dict:
-    profile_id = str(payload.get("profile_id") or "").strip()
-    invoice_id = str(payload.get("invoice_id") or "").strip()
+    profile_id = _normalize_optional_uuid(str(payload.get("profile_id") or "").strip())
+    invoice_id = _normalize_optional_uuid(str(payload.get("invoice_id") or "").strip())
+    storage_path = str(payload.get("storage_path") or "").strip()
     if not profile_id or not invoice_id:
         raise ApiError(status_code=400, code="invalid_payload", message="profile_id and invoice_id are required.")
+    if not storage_path:
+        raise ApiError(status_code=400, code="invalid_payload", message="storage_path is required.")
     apply_db_auth_context(conn, auth.user_id)
     invoice_documents_relation = _business_invoice_documents_relation(conn)
     if not invoice_documents_relation:
         raise ApiError(status_code=500, code="invoice_documents_table_missing", message="Invoice document table is not available.")
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            insert into {invoice_documents_relation} (
-              user_id, profile_id, invoice_id, storage_path, file_name, mime_type, template_version, file_size_bytes
-            ) values (
-              %(user_id)s, %(profile_id)s, %(invoice_id)s, %(storage_path)s, %(file_name)s, %(mime_type)s, %(template_version)s, %(file_size_bytes)s
-            )
-            on conflict (invoice_id, template_version)
-            do update set
-              storage_path = excluded.storage_path,
-              file_name = excluded.file_name,
-              mime_type = excluded.mime_type,
-              file_size_bytes = excluded.file_size_bytes
-            returning *
-            """,
-            {
-                "user_id": auth.user_id,
-                "profile_id": profile_id,
-                "invoice_id": invoice_id,
-                "storage_path": payload.get("storage_path"),
-                "file_name": payload.get("file_name"),
-                "mime_type": payload.get("mime_type") or "application/pdf",
-                "template_version": payload.get("template_version") or "invoice_a4_v1",
-                "file_size_bytes": payload.get("file_size_bytes"),
-            },
-        )
-        item = cur.fetchone()
+    has_file_name_col = _relation_has_column(conn, invoice_documents_relation, "file_name")
+    has_mime_type_col = _relation_has_column(conn, invoice_documents_relation, "mime_type")
+    has_template_version_col = _relation_has_column(conn, invoice_documents_relation, "template_version")
+    has_file_size_col = _relation_has_column(conn, invoice_documents_relation, "file_size_bytes")
+    has_updated_at_col = _relation_has_column(conn, invoice_documents_relation, "updated_at")
+    conflict_clause = _invoice_documents_upsert_conflict_clause(conn, invoice_documents_relation)
+    template_version = str(payload.get("template_version") or "invoice_a4_v1")
+
+    insert_columns = ["user_id", "profile_id", "invoice_id", "storage_path"]
+    insert_values = ["%(user_id)s", "%(profile_id)s", "%(invoice_id)s", "%(storage_path)s"]
+    update_sets = ["storage_path = excluded.storage_path"]
+    binds: dict[str, object] = {
+        "user_id": auth.user_id,
+        "profile_id": profile_id,
+        "invoice_id": invoice_id,
+        "storage_path": storage_path,
+        "template_version": template_version,
+    }
+    if has_file_name_col:
+        insert_columns.append("file_name")
+        insert_values.append("%(file_name)s")
+        update_sets.append("file_name = excluded.file_name")
+        binds["file_name"] = payload.get("file_name")
+    if has_mime_type_col:
+        insert_columns.append("mime_type")
+        insert_values.append("%(mime_type)s")
+        update_sets.append("mime_type = excluded.mime_type")
+        binds["mime_type"] = payload.get("mime_type") or "application/pdf"
+    if has_template_version_col:
+        insert_columns.append("template_version")
+        insert_values.append("%(template_version)s")
+        update_sets.append("template_version = excluded.template_version")
+    if has_file_size_col:
+        insert_columns.append("file_size_bytes")
+        insert_values.append("%(file_size_bytes)s")
+        update_sets.append("file_size_bytes = excluded.file_size_bytes")
+        binds["file_size_bytes"] = payload.get("file_size_bytes")
+    if has_updated_at_col:
+        update_sets.append("updated_at = now()")
+
+    try:
+        with conn.cursor() as cur:
+            if conflict_clause:
+                cur.execute(
+                    f"""
+                    insert into {invoice_documents_relation} ({", ".join(insert_columns)})
+                    values ({", ".join(insert_values)})
+                    {conflict_clause}
+                    do update set {", ".join(update_sets)}
+                    returning *
+                    """,
+                    binds,
+                )
+                item = cur.fetchone()
+            else:
+                where_clause = "invoice_id = %(invoice_id)s and user_id = %(user_id)s and profile_id = %(profile_id)s"
+                if has_template_version_col:
+                    where_clause += " and coalesce(template_version, 'invoice_a4_v1') = %(template_version)s"
+                update_fields: list[str] = ["storage_path = %(storage_path)s"]
+                if has_file_name_col:
+                    update_fields.append("file_name = %(file_name)s")
+                if has_mime_type_col:
+                    update_fields.append("mime_type = %(mime_type)s")
+                if has_file_size_col:
+                    update_fields.append("file_size_bytes = %(file_size_bytes)s")
+                if has_updated_at_col:
+                    update_fields.append("updated_at = now()")
+                cur.execute(
+                    f"""
+                    update {invoice_documents_relation}
+                    set {", ".join(update_fields)}
+                    where {where_clause}
+                    returning *
+                    """,
+                    binds,
+                )
+                item = cur.fetchone()
+                if not item:
+                    cur.execute(
+                        f"""
+                        insert into {invoice_documents_relation} ({", ".join(insert_columns)})
+                        values ({", ".join(insert_values)})
+                        returning *
+                        """,
+                        binds,
+                    )
+                    item = cur.fetchone()
+    except PsycopgError as exc:
+        raise ApiError(
+            status_code=500,
+            code="invoice_document_upsert_failed",
+            message=f"Failed to upsert invoice document: {str(exc).splitlines()[0]}",
+        ) from exc
     if not item:
         raise ApiError(status_code=500, code="invoice_document_upsert_failed", message="Could not upsert invoice document.")
     return {"item": item}

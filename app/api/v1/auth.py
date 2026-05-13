@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app.core.config import Settings, get_settings
+from app.core.db import get_pooled_conn
 from app.core.errors import ApiError
 from app.core.supabase_auth_client import supabase_auth_post
 from app.schemas.auth import (
@@ -16,6 +17,53 @@ from app.schemas.auth import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _email_already_registered(email: str) -> bool:
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        return False
+
+    try:
+        with get_pooled_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select exists(
+                        select 1
+                        from auth.users
+                        where lower(email) = %s
+                          and coalesce(deleted_at is null, true)
+                          and email_confirmed_at is not null
+                    ) as email_exists
+                    """,
+                    (normalized_email,),
+                )
+                row = cur.fetchone() or {}
+                if bool(row.get("email_exists")):
+                    return True
+    except Exception:
+        # If auth.users is not reachable/visible in this environment, we still
+        # keep signup flow functional using public.user_profiles as a fallback.
+        pass
+
+    try:
+        with get_pooled_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select exists(
+                        select 1
+                        from public.user_profiles
+                        where lower(email) = %s
+                    ) as email_exists
+                    """,
+                    (normalized_email,),
+                )
+                row = cur.fetchone() or {}
+                return bool(row.get("email_exists"))
+    except Exception:
+        return False
 
 
 def _map_user(user: dict | None) -> AuthUserResponse | None:
@@ -39,6 +87,13 @@ def _map_user(user: dict | None) -> AuthUserResponse | None:
 
 @router.post("/signup", response_model=AuthOperationResponse)
 def sign_up(payload: SignUpRequest, settings: Settings = Depends(get_settings)) -> AuthOperationResponse:
+    if _email_already_registered(payload.email):
+        raise ApiError(
+            status_code=409,
+            code="user_already_exists",
+            message="User already exists.",
+        )
+
     data = supabase_auth_post(
         settings,
         "/signup",
@@ -52,6 +107,15 @@ def sign_up(payload: SignUpRequest, settings: Settings = Depends(get_settings)) 
     session = data.get("session") or {}
     has_signup_session = bool(session.get("access_token"))
     needs_confirmation = bool(user and not has_signup_session)
+    if not user and not has_signup_session:
+        # Supabase can return an empty {user, session} signup response in
+        # email-confirmation mode for privacy-preserving auth flows. Because we
+        # already pre-checked for existing email above, treat this as a
+        # confirmation-required path for new signup.
+        return AuthOperationResponse(
+            user=None,
+            needsEmailConfirmation=True,
+        )
     if settings.auth_require_email_confirmation and has_signup_session:
         raise ApiError(
             status_code=409,
@@ -174,17 +238,35 @@ def verify_otp_login(
 def forgot_password(
     payload: ForgotPasswordRequest, settings: Settings = Depends(get_settings)
 ) -> AuthOperationResponse:
+    # Use Supabase recovery flow so the Reset Password email template is used.
     supabase_auth_post(settings, "/recover", {"email": payload.email})
     return AuthOperationResponse()
 
 
-@router.post("/reset-password-otp", response_model=AuthOperationResponse)
+# Backward-compatible aliases:
+# - /reset-password-otp is the current mobile endpoint
+# - /reset-password supports older clients/backends
+# Accept multiple write methods to avoid 405 drift across environments.
+@router.api_route(
+    "/reset-password-otp",
+    methods=["POST", "PUT", "PATCH"],
+    response_model=AuthOperationResponse,
+)
+@router.api_route(
+    "/reset-password",
+    methods=["POST", "PUT", "PATCH"],
+    response_model=AuthOperationResponse,
+)
 def reset_password_with_otp(
     payload: ResetPasswordWithOtpRequest, settings: Settings = Depends(get_settings)
 ) -> AuthOperationResponse:
     verify_data = None
-    last_error = None
-    for otp_type in ("email", "recovery"):
+    last_error: ApiError | None = None
+
+    # Use the stable /verify OTP flow first across likely OTP types.
+    # Avoid relying on /token grant_type=otp because some projects reject it
+    # with "unsupported_grant_type".
+    for otp_type in ("recovery", "email", "magiclink", "signup"):
         try:
             verify_data = supabase_auth_post(
                 settings,
@@ -193,8 +275,10 @@ def reset_password_with_otp(
             )
             last_error = None
             break
-        except Exception as exc:
+        except ApiError as exc:
+            # Keep trying other OTP types.
             last_error = exc
+            continue
 
     if last_error:
         raise last_error

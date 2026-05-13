@@ -43,6 +43,7 @@ def create_account(
     account_type: str,
     opening_balance: float,
     opening_date: str,
+    qr_image_url: str | None = None,
 ) -> dict:
     resolved_profile_id = profile_id or get_active_profile_id(conn, user_id)
     if not resolved_profile_id:
@@ -59,6 +60,7 @@ def create_account(
         account_type=account_type,
         opening_balance=opening_balance,
         opening_date=opening_date,
+        qr_image_url=qr_image_url,
     )
     account = get_account_by_id(conn, user_id=user_id, account_id=account_id)
     if not account:
@@ -81,6 +83,7 @@ def save_bank_account_settings(
     name: str,
     allow_overdraft: bool,
     overdraft_limit: float,
+    qr_image_url: str | None = None,
 ) -> dict:
     account = update_bank_account_settings(
         conn,
@@ -89,6 +92,7 @@ def save_bank_account_settings(
         name=name.strip(),
         allow_overdraft=allow_overdraft,
         overdraft_limit=max(0, float(overdraft_limit or 0)),
+        qr_image_url=qr_image_url,
     )
     if not account:
         raise ApiError(status_code=404, code="account_not_found", message="Bank account not found.")

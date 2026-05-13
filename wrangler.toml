@@ -1,0 +1,28 @@
+name = "money-tracker-api"
+main = "src/worker.py"
+compatibility_date = "2026-05-13"
+workers_dev = true
+keep_vars = true
+compatibility_flags = ["python_workers"]
+
+[vars]
+APP_ENV = "production"
+APP_NAME = "arthaX Backend"
+API_PREFIX = "/api/v1"
+
+SUPABASE_URL = "https://phjtgfepawvhblyqozbe.supabase.co"
+SUPABASE_ANON_KEY = "sb_publishable_3kqK3Lp_c8hB8-u3eWn45A_f3iAnzNC"
+SUPABASE_JWT_AUD = "authenticated"
+
+CORS_ORIGINS = "http://localhost:8081,http://127.0.0.1:8081,http://localhost:19006,http://127.0.0.1:19006,exp://127.0.0.1:8081"
+
+DB_CONNECT_TIMEOUT_SEC = "5"
+DB_POOL_ACQUIRE_TIMEOUT_SEC = "8"
+SUPABASE_AUTH_TIMEOUT_SEC = "8"
+
+CHAT_API_ENDPOINT = "https://se6ju6ydv8.execute-api.us-east-1.amazonaws.com/chat"
+PERSONAL_CHAT_API_ENDPOINT = "https://se6ju6ydv8.execute-api.us-east-1.amazonaws.com/chat"
+BUSINESS_CHAT_API_ENDPOINT = "https://se6ju6ydv8.execute-api.us-east-1.amazonaws.com/chat"
+
+RECEIPT_AWS_REGION = "us-east-1"
+RECEIPT_TIMEOUT_SEC = "90"

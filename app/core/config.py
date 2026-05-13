@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     personal_chat_api_fallback_endpoint: str | None = Field(
         default=None, alias="PERSONAL_CHAT_API_FALLBACK_ENDPOINT"
     )
+    personal_chat_match_threshold: float = Field(default=0.55, alias="PERSONAL_CHAT_MATCH_THRESHOLD")
+    personal_chat_match_count: int = Field(default=8, alias="PERSONAL_CHAT_MATCH_COUNT")
 
     business_chat_api_endpoint: str | None = Field(default=None, alias="BUSINESS_CHAT_API_ENDPOINT")
     business_chat_api_key: str | None = Field(default=None, alias="BUSINESS_CHAT_API_KEY")
@@ -83,7 +85,7 @@ class Settings(BaseSettings):
         default=None,
         alias="RECEIPT_TEXTRACT_ENDPOINT",
     )
-    receipt_timeout_sec: int = Field(default=30, alias="RECEIPT_TIMEOUT_SEC")
+    receipt_timeout_sec: int = Field(default=60, alias="RECEIPT_TIMEOUT_SEC")
 
     @property
     def supabase_issuer(self) -> str:

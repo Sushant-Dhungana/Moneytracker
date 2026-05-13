@@ -45,6 +45,7 @@ def list_accounts(conn: Connection, user_id: str, profile_id: str) -> list[dict]
       a.opening_date::text as opening_date,
       a.institution_name,
       a.account_number,
+      a.qr_image_url,
       a.allow_overdraft,
       a.overdraft_limit,
       a.is_active,
@@ -72,6 +73,7 @@ def create_account_with_opening(
     account_type: str,
     opening_balance: float,
     opening_date: str,
+    qr_image_url: str | None = None,
 ) -> str:
     query = """
     select public.create_account_with_opening(
@@ -89,6 +91,16 @@ def create_account_with_opening(
             (user_id, name, account_type, opening_balance, opening_date, profile_id),
         )
         row = cur.fetchone()
+        if qr_image_url is not None:
+            cur.execute(
+                """
+                update public.accounts
+                set qr_image_url = %s::text
+                where id = %s::uuid
+                  and user_id = %s::uuid
+                """,
+                (qr_image_url.strip() or None, row["account_id"], user_id),
+            )
     return str(row["account_id"])
 
 
@@ -103,6 +115,7 @@ def get_account_by_id(conn: Connection, *, user_id: str, account_id: str) -> dic
       a.opening_date::text as opening_date,
       a.institution_name,
       a.account_number,
+      a.qr_image_url,
       a.allow_overdraft,
       a.overdraft_limit,
       a.is_active,
@@ -135,6 +148,7 @@ def update_account_name(
       opening_date::text as opening_date,
       institution_name,
       account_number,
+      qr_image_url,
       allow_overdraft,
       overdraft_limit,
       is_active,
@@ -154,13 +168,15 @@ def update_bank_account_settings(
     name: str,
     allow_overdraft: bool,
     overdraft_limit: float,
+    qr_image_url: str | None = None,
 ) -> dict | None:
     query = """
     update public.accounts
     set
       name = %s::text,
       allow_overdraft = %s::boolean,
-      overdraft_limit = %s::numeric
+      overdraft_limit = %s::numeric,
+      qr_image_url = coalesce(%s::text, qr_image_url)
     where id = %s::uuid
       and user_id = %s::uuid
       and type = 'bank'
@@ -173,6 +189,7 @@ def update_bank_account_settings(
       opening_date::text as opening_date,
       institution_name,
       account_number,
+      qr_image_url,
       allow_overdraft,
       overdraft_limit,
       is_active,
@@ -186,6 +203,7 @@ def update_bank_account_settings(
                 name,
                 allow_overdraft,
                 overdraft_limit if allow_overdraft else 0,
+                qr_image_url.strip() if isinstance(qr_image_url, str) and qr_image_url.strip() else None,
                 account_id,
                 user_id,
             ),

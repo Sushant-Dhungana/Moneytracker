@@ -1,10 +1,18 @@
 import json
+import logging
 from collections.abc import Generator
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from psycopg import Connection
 
+from app.arthaxai.chat.history import (
+    append_chat_message,
+    ensure_chat_thread,
+    fetch_chat_messages,
+    list_chat_threads,
+)
+from app.arthaxai.chat.orchestrator import generate_chat_reply
 from app.core.auth import AuthContext, get_auth_context
 from app.core.config import Settings, get_settings
 from app.core.db import apply_db_auth_context, get_db_conn
@@ -15,16 +23,9 @@ from app.schemas.ai import (
     ChatThreadsResponse,
     PersonalChatRequest,
 )
-from app.services.ai_business_service import generate_business_chat_reply
-from app.services.ai_history_service import (
-    append_chat_message,
-    ensure_chat_thread,
-    fetch_chat_messages,
-    list_chat_threads,
-)
-from app.services.ai_personal_service import generate_personal_chat_reply
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+logger = logging.getLogger(__name__)
 
 
 
@@ -73,13 +74,23 @@ def post_personal_chat(
         content=payload.message,
     )
 
-    reply, usage, warnings = generate_personal_chat_reply(
-        conn,
-        settings=settings,
-        user_id=auth.user_id,
-        thread_id=thread_id,
-        user_query=payload.message,
-    )
+    try:
+        reply, usage, warnings = generate_chat_reply(
+            conn,
+            settings=settings,
+            scope="personal",
+            user_id=auth.user_id,
+            thread_id=thread_id,
+            user_query=payload.message,
+        )
+    except Exception:
+        logger.exception("Personal chat generation failed for user_id=%s", auth.user_id)
+        reply = (
+            "I could not complete the personal finance reply right now. "
+            "Please try again in a moment."
+        )
+        usage = {"route": "personal_error_fallback", "mode": "finance"}
+        warnings = ["personal_chat_generation_failed"]
 
     append_chat_message(
         conn,
@@ -178,9 +189,10 @@ def post_business_chat(
         content=payload.message,
     )
 
-    reply, usage, warnings = generate_business_chat_reply(
+    reply, usage, warnings = generate_chat_reply(
         conn,
         settings=settings,
+        scope="business",
         user_id=auth.user_id,
         profile_id=profile_id,
         thread_id=thread_id,

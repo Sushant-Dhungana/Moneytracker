@@ -1,9 +1,10 @@
 from datetime import date
 
-from app.services.ai_business_query_service import (
+from app.arthaxai.services.ai_business_query_service import (
     _not_found_reply,
     parse_business_query_understanding,
     resolve_party_name_candidates,
+    try_generate_deterministic_business_response,
 )
 
 
@@ -39,10 +40,37 @@ def test_parse_dynamic_product_stock_quantity_intent() -> None:
     assert "wai wai" in understanding.entity_text_candidates
 
 
+def test_parse_product_possession_quantity_query_as_stock_lookup() -> None:
+    understanding = parse_business_query_understanding("how many tyre do i have")
+    assert understanding.intent == "stock_quantity_lookup"
+    assert understanding.entity_type_hint == "product"
+    assert "tyre" in understanding.entity_text_candidates
+    assert understanding.response_language_mode == "english"
+
+
+def test_parse_neplish_stock_query_marks_neplish_mode() -> None:
+    understanding = parse_business_query_understanding("tyre ko stock kati cha")
+    assert understanding.response_language_mode == "neplish"
+
+
 def test_parse_dynamic_product_stock_existence_intent() -> None:
     understanding = parse_business_query_understanding("rice stock ma cha ki chaina?")
     assert understanding.intent == "stock_existence"
     assert understanding.entity_type_hint == "product"
+
+
+def test_parse_generic_stock_overview_query() -> None:
+    understanding = parse_business_query_understanding("what are the product that i have in stock")
+    assert understanding.intent == "stock_existence"
+    assert understanding.entity_type_hint == "product"
+    assert "what are the product that i have in stock" not in understanding.entity_text_candidates
+
+
+def test_parse_stock_report_query_as_generic_stock_overview() -> None:
+    understanding = parse_business_query_understanding("give me stock report")
+    assert understanding.intent == "stock_existence"
+    assert understanding.entity_type_hint == "product"
+    assert understanding.entity_text_candidates == []
 
 
 def test_parse_dynamic_product_price_and_low_stock_intents() -> None:
@@ -86,6 +114,30 @@ def test_party_transactions_defaults_to_all_time() -> None:
     assert understanding.scope.label == "all time"
 
 
+def test_general_ledger_query_does_not_treat_generic_words_as_party_name() -> None:
+    understanding = parse_business_query_understanding("show general ledger")
+    assert understanding.intent == "party_transactions"
+    assert understanding.entity_text_candidates == []
+
+
+def test_total_transaction_history_query_does_not_treat_total_as_party_name() -> None:
+    understanding = parse_business_query_understanding("give me my total transaction history")
+    assert understanding.intent == "party_transactions"
+    assert understanding.entity_text_candidates == []
+
+
+def test_generic_transaction_history_falls_back_instead_of_not_found() -> None:
+    result = try_generate_deterministic_business_response(
+        None,
+        user_id="user-1",
+        profile_id="profile-1",
+        user_query="show transaction history",
+    )
+    assert result.handled is False
+    assert result.route == "llm_fallback"
+    assert result.resolution_status == "fallback"
+
+
 def test_dynamic_fuzzy_customer_resolution_with_typo() -> None:
     understanding = parse_business_query_understanding("Roshni Dhungna ko due kati cha?")
     resolution = resolve_party_name_candidates(
@@ -120,6 +172,44 @@ def test_dynamic_fuzzy_product_resolution_with_partial_name() -> None:
     assert resolution.selected is not None
     assert resolution.selected.kind == "product"
     assert resolution.selected.id == "p-1"
+
+
+def test_dynamic_fuzzy_product_resolution_handles_descriptive_stock_question() -> None:
+    understanding = parse_business_query_understanding("how many mineral water do i have in my data")
+    resolution = resolve_party_name_candidates(
+        understanding,
+        customers=[],
+        suppliers=[],
+        products=[
+            {"id": "p-1", "name": "Mineral Water 1L"},
+            {"id": "p-2", "name": "Mineral Water 500ml"},
+            {"id": "p-3", "name": "Rice"},
+        ],
+    )
+
+    assert resolution.status == "resolved"
+    assert resolution.selected is not None
+    assert resolution.selected.kind == "product"
+    assert resolution.selected.id == "p-1"
+
+
+def test_product_family_stock_query_keeps_related_variants() -> None:
+    understanding = parse_business_query_understanding("how many tyre do i have")
+    resolution = resolve_party_name_candidates(
+        understanding,
+        customers=[],
+        suppliers=[],
+        products=[
+            {"id": "p-1", "name": "Tyre", "qty_on_hand": 2},
+            {"id": "p-2", "name": "Tyre 215", "qty_on_hand": 5},
+            {"id": "p-3", "name": "Tyre 235", "qty_on_hand": 1},
+            {"id": "p-4", "name": "Tube", "qty_on_hand": 9},
+        ],
+    )
+
+    assert understanding.intent == "stock_quantity_lookup"
+    assert resolution.selected is not None
+    assert resolution.selected.kind == "product"
 
 
 def test_ambiguous_same_name_customer_and_supplier_requires_clarification() -> None:
@@ -170,6 +260,24 @@ def test_supplier_items_phrase_resolves_dynamic_supplier_name() -> None:
     assert resolution.selected is not None
     assert resolution.selected.kind == "supplier"
     assert resolution.selected.id == "s-1"
+
+
+def test_supplier_product_query_resolves_both_supplier_and_product() -> None:
+    understanding = parse_business_query_understanding("how much tyre did i purchase from sushant")
+    resolution = resolve_party_name_candidates(
+        understanding,
+        customers=[],
+        suppliers=[{"id": "s-1", "name": "Sushant"}],
+        products=[{"id": "p-1", "name": "Tyre"}, {"id": "p-2", "name": "Tube"}],
+    )
+
+    assert understanding.intent == "supplier_purchase_total"
+    assert resolution.selected is not None
+    assert resolution.selected.kind == "supplier"
+    assert resolution.selected.id == "s-1"
+    assert resolution.product is not None
+    assert resolution.product.kind == "product"
+    assert resolution.product.id == "p-1"
 
 
 def test_not_found_entity_returns_not_found_status() -> None:
