@@ -63,3 +63,39 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.pyc
+
+# Secrets / local env
+.env
+.dev.vars
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+
+# Secrets / local env
+.env
+.dev.vars
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+
+# Secrets / local env
+.env
+.dev.vars
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+
+# Secrets / local env
+.env
+.dev.vars
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
