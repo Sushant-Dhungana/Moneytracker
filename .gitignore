@@ -55,3 +55,11 @@ temp/
 # Render / deployment local files if any
 *.pem
 *.key
+# Secrets / local env
+.env
+.dev.vars
+.venv
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
